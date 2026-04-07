@@ -1,0 +1,5 @@
+.env
+resume_tool/.env
+__pycache__/
+*.pyc
+.DS_Store
