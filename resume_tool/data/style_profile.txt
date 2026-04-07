@@ -1,0 +1,6 @@
+Tone: direct, technical, not overly formal. No buzzwords like "passionate" or "leverage".
+Length: 3 short paragraphs max.
+Always mention: my competitive programming background when relevant to problem-solving roles.
+Never mention: salary expectations, references to being a fast learner.
+Opening style: lead with a specific thing about the company or role, not "I am writing to apply for".
+Closing style: one confident sentence, no "thank you for your consideration" filler.
