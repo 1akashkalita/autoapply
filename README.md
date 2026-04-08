@@ -68,6 +68,9 @@ directly in your browser using your saved profile data.
   easy to add new sites
 - **No auto-submit** -- the extension never clicks Submit; you stay in control
 - **Logging** -- tracks all filled and skipped fields for review
+- **Base resume PDF storage** -- upload and keep your base resume PDF in extension-local storage
+- **Job-scoped document vault** -- store edited resume PDFs and cover letters grouped by detected job
+- **Per-job download/delete controls** -- manage saved documents from the popup with job-based filenames
 
 ### Setup
 
@@ -106,6 +109,27 @@ For richer LLM results, also paste your `master_resume.json` or `tailored_resume
 into the **Resume Data** section. The LLM uses both your applicant profile and resume
 when mapping ambiguous fields.
 
+### Document Storage (Base Resume + Per-Job Files)
+
+The extension now stores document artifacts locally in `chrome.storage.local`:
+
+- **Base Resume PDF** (Options page):
+  - Upload a base resume PDF from **Options -> Base Resume PDF**
+  - View stored metadata (file name, size, timestamp)
+  - Download or clear the stored base PDF
+- **Per-job document storage** (Popup):
+  - On a job page, the extension derives a stable `jobKey` from job metadata and URL
+  - Save **edited resume PDFs** and **cover letters** under that job
+  - Cover letters can be saved as PDF uploads or plain text
+  - Downloaded files use a job-based naming pattern like:
+    - `Company-Title-YYYYMMDD-edited-resume.pdf`
+    - `Company-Title-YYYYMMDD-cover-letter.pdf`
+
+Storage safeguards:
+- Keeps recent documents per job (bounded list) to avoid unbounded growth
+- Trims oldest stored docs when local storage approaches a soft size cap
+- Handles missing/unknown job metadata with safe filename and key fallbacks
+
 ### Architecture
 
 ```
@@ -138,8 +162,8 @@ extension/
 ```
 
 **Data flow:** Popup -> Background (loads profile + resume, runs matching via
-`match_rules.js`) -> Content Script (scans DOM, previews, fills) -> Background
-(stores log) -> Popup (shows results).
+`match_rules.js`) -> Content Script (scans DOM, derives `jobKey`, previews, fills) ->
+Background (stores logs + document artifacts) -> Popup (shows results + per-job documents).
 
 ### Adding Support for a New Site
 
@@ -183,8 +207,9 @@ window.JobAutofill.MySiteAdapter.extractFields = function () {
 
 ### Limitations
 
-- **File uploads** (resume PDF) cannot be programmatically set by Chrome extensions due
-  to browser security restrictions
+- **Form file inputs** (resume upload fields in job forms) still cannot be programmatically
+  set by Chrome extensions due to browser security restrictions
+- Document storage is local to the browser profile (not synced to a backend)
 - **Vision-based resolution** (screenshot + GPT vision) from the Python agent is not
   ported to the extension
 - **Cross-origin iframes** (e.g., embedded Workday application frames) may not be
