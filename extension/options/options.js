@@ -28,6 +28,9 @@
     if (resp.resume) {
       document.getElementById("resumeJson").value = JSON.stringify(resp.resume, null, 2);
     }
+    if (resp.styleProfile) {
+      document.getElementById("styleProfile").value = resp.styleProfile;
+    }
 
     renderBaseResumePdfMeta(resp.baseResumePdfMeta || null);
   }
@@ -115,12 +118,17 @@
     }
   });
 
-  // Save AI settings
+  // Save AI settings (API key, LLM toggle, style profile)
   document.getElementById("btnSaveAi").addEventListener("click", async () => {
     const apiKey = document.getElementById("apiKey").value.trim();
     const llmEnabled = document.getElementById("llmEnabled").checked;
+    const styleProfile = document.getElementById("styleProfile").value.trim();
+
     const resp = await sendBg({ action: "saveSettings", apiKey, llmEnabled });
-    showStatus("aiStatus", resp.ok ? "AI settings saved." : "Save failed.", resp.ok);
+    if (styleProfile) {
+      await sendBg({ action: "saveStyleProfile", styleProfile });
+    }
+    showStatus("aiSettingsStatus", resp.ok ? "AI settings saved." : "Save failed.", resp.ok);
   });
 
   // Save resume JSON

@@ -30,9 +30,21 @@
   const coverLetterText = document.getElementById("coverLetterText");
   const btnSaveCoverLetterText = document.getElementById("btnSaveCoverLetterText");
 
+  // AI Optimize UI
+  const btnAiOptimize = document.getElementById("btnAiOptimize");
+  const aiSection = document.getElementById("aiSection");
+  const aiStatus = document.getElementById("aiStatus");
+  const aiGapSection = document.getElementById("aiGapSection");
+  const aiGapList = document.getElementById("aiGapList");
+  const aiDiffSection = document.getElementById("aiDiffSection");
+  const aiResumeDiff = document.getElementById("aiResumeDiff");
+  const aiCoverLetterSection = document.getElementById("aiCoverLetterSection");
+  const aiCoverLetter = document.getElementById("aiCoverLetter");
+
   let currentMappings = null;
   let currentJobKey = null;
   let currentJobMeta = null;
+  let lastAiResult = null;
 
   // ---- Init ----
 
@@ -53,11 +65,16 @@
       }
     }
 
-    // Show LLM status
+    // Show LLM status and enable AI Optimize if available
     if (settings.ok) {
-      llmStatusEl.textContent = settings.llmEnabled && settings.apiKey
-        ? "LLM: On"
-        : "LLM: Off";
+      const llmReady = settings.llmEnabled && settings.apiKey;
+      llmStatusEl.textContent = llmReady ? "LLM: On" : "LLM: Off";
+      if (llmReady && settings.resume) {
+        btnAiOptimize.disabled = false;
+        btnAiOptimize.title = "Optimize resume & generate cover letter for this job";
+      } else if (llmReady && !settings.resume) {
+        btnAiOptimize.title = "Upload resume JSON in Options to use AI Optimize";
+      }
     }
 
     // Check content script connectivity
@@ -73,6 +90,7 @@
       setStatus("No page access", "warning");
       btnPreview.disabled = true;
       btnFill.disabled = true;
+      btnAiOptimize.disabled = true;
     }
 
     // Load job context + docs list (best-effort)
@@ -257,6 +275,241 @@
         }
       }
     });
+  }
+
+  // ---- AI Optimize ----
+
+  if (btnAiOptimize) {
+    btnAiOptimize.addEventListener("click", async () => {
+      setStatus("Optimizing...", "active");
+      btnAiOptimize.disabled = true;
+      aiSection.classList.remove("hidden");
+      aiGapSection.classList.add("hidden");
+      aiDiffSection.classList.add("hidden");
+      aiCoverLetterSection.classList.add("hidden");
+      aiStatus.innerHTML = '<span class="ai-spinner"></span> Extracting job description...';
+      aiStatus.className = "ai-status ai-status-loading";
+
+      // 1. Extract JD from current page
+      let jdResult;
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab || !tab.id) {
+          showAiError("No active tab found.");
+          return;
+        }
+        jdResult = await chrome.tabs.sendMessage(tab.id, { action: "extractJobDescription" });
+      } catch (e) {
+        showAiError("Could not reach content script. Try refreshing the page.");
+        return;
+      }
+
+      if (!jdResult || !jdResult.ok || jdResult.wordCount < 50) {
+        showAiError("Could not extract a job description from this page (found " + (jdResult ? jdResult.wordCount : 0) + " words). Try a page with a full job posting.");
+        return;
+      }
+
+      aiStatus.innerHTML = '<span class="ai-spinner"></span> Analyzing job & tailoring resume... (this takes 15-30s)';
+
+      // 2. Ensure we have job context
+      if (!currentJobKey) {
+        try {
+          const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (tab && tab.id) {
+            const ctx = await chrome.tabs.sendMessage(tab.id, { action: "getJobContext" });
+            if (ctx && ctx.ok) {
+              currentJobKey = ctx.jobKey;
+              currentJobMeta = ctx.jobMeta;
+              renderJobContextLine();
+            }
+          }
+        } catch (e) { /* continue anyway */ }
+      }
+
+      // 3. Call background to generate documents
+      let result;
+      try {
+        result = await sendBg({
+          action: "generateAiDocuments",
+          jdText: jdResult.jdText,
+          jobKey: currentJobKey,
+          jobMeta: currentJobMeta,
+        });
+      } catch (e) {
+        showAiError("AI generation failed: " + String(e));
+        return;
+      }
+
+      if (!result || !result.ok) {
+        showAiError(result ? result.error : "No response from background.");
+        return;
+      }
+
+      lastAiResult = result;
+
+      // 4. Render results
+      renderAiResults(result);
+
+      // 5. Auto-download + save to storage
+      await saveAndDownloadAiDocs(result);
+
+      setStatus("Optimized", "success");
+      btnAiOptimize.disabled = false;
+    });
+  }
+
+  function showAiError(message) {
+    aiStatus.textContent = message;
+    aiStatus.className = "ai-status ai-status-error";
+    btnAiOptimize.disabled = false;
+    setStatus("Error", "error");
+  }
+
+  function renderAiResults(result) {
+    aiStatus.textContent = "Done! Resume and cover letter generated.";
+    aiStatus.className = "ai-status ai-status-success";
+
+    // Requirements gap list
+    const gaps = result.requirementsGaps || [];
+    if (gaps.length > 0) {
+      aiGapSection.classList.remove("hidden");
+      let gapHtml = "";
+      for (const gap of gaps) {
+        let statusClass = "gap-met";
+        let statusLabel = "Met";
+        if (gap.status === "partially_met") { statusClass = "gap-partial"; statusLabel = "Partial"; }
+        else if (gap.status === "not_met") { statusClass = "gap-missing"; statusLabel = "Not Met"; }
+        else if (gap.status === "filled_by_generated_project") { statusClass = "gap-generated"; statusLabel = "Generated"; }
+
+        gapHtml +=
+          '<div class="gap-row ' + statusClass + '">' +
+          '<span class="gap-status-badge">' + escHtml(statusLabel) + "</span>" +
+          '<span class="gap-text">' + escHtml(gap.requirement || "") + "</span>" +
+          (gap.notes ? '<span class="gap-notes">' + escHtml(gap.notes) + "</span>" : "") +
+          "</div>";
+      }
+      aiGapList.innerHTML = gapHtml;
+    }
+
+    // Resume diff
+    const diff = result.diff || [];
+    if (diff.length > 0) {
+      aiDiffSection.classList.remove("hidden");
+      let diffHtml = "";
+      for (const entry of diff) {
+        let headerClass = entry.generated ? "diff-header diff-generated-header" : "diff-header";
+        diffHtml += '<div class="' + headerClass + '">' + escHtml(entry.header);
+        if (entry.generated) {
+          diffHtml += ' <span class="diff-generated-badge">Generated &mdash; review before submitting</span>';
+        }
+        diffHtml += "</div>";
+
+        for (const b of entry.bullets) {
+          if (b.type === "changed") {
+            diffHtml +=
+              '<div class="diff-line diff-removed">&minus; ' + escHtml(truncate(b.origText, 120)) + "</div>" +
+              '<div class="diff-line diff-added">&plus; ' + escHtml(truncate(b.newText, 120)) + "</div>";
+          } else if (b.type === "added") {
+            diffHtml += '<div class="diff-line diff-added">&plus; ' + escHtml(truncate(b.newText, 120)) + "</div>";
+          }
+        }
+      }
+      aiResumeDiff.innerHTML = diffHtml;
+    }
+
+    // Cover letter
+    if (result.coverLetterText) {
+      aiCoverLetterSection.classList.remove("hidden");
+      aiCoverLetter.value = result.coverLetterText;
+    }
+  }
+
+  async function saveAndDownloadAiDocs(result) {
+    const JA = window.JobAutofill || {};
+    const settings = await sendBg({ action: "getSettings" });
+    const personal = (settings.ok && settings.resume && settings.resume.personal) ? settings.resume.personal : {};
+    const now = new Date().toISOString();
+
+    // Build HTML for resume
+    if (result.tailoredResume && JA.buildResumeHtml) {
+      const resumeHtml = JA.buildResumeHtml(result.tailoredResume);
+      const resumeB64 = base64FromUtf8(resumeHtml);
+
+      // Download to user's computer
+      downloadHtmlAsFile(resumeHtml, buildAiFilename("tailored-resume", "html"));
+
+      // Save to job bucket
+      if (currentJobKey) {
+        const doc = {
+          id: genId(),
+          name: buildAiFilename("tailored-resume", "html"),
+          mime: "text/html",
+          size: resumeHtml.length,
+          createdAt: now,
+          dataBase64: resumeB64,
+        };
+        await sendBg({
+          action: "saveJobDocument",
+          jobKey: currentJobKey,
+          jobMeta: currentJobMeta,
+          docType: "editedResume",
+          doc,
+        });
+      }
+    }
+
+    // Build HTML for cover letter
+    if (result.coverLetterText && JA.buildCoverLetterHtml) {
+      const clHtml = JA.buildCoverLetterHtml(result.coverLetterText, currentJobMeta, personal);
+      const clB64 = base64FromUtf8(clHtml);
+
+      // Download to user's computer
+      downloadHtmlAsFile(clHtml, buildAiFilename("cover-letter", "html"));
+
+      // Save to job bucket
+      if (currentJobKey) {
+        const doc = {
+          id: genId(),
+          name: buildAiFilename("cover-letter", "html"),
+          mime: "text/html",
+          size: clHtml.length,
+          createdAt: now,
+          dataBase64: clB64,
+        };
+        await sendBg({
+          action: "saveJobDocument",
+          jobKey: currentJobKey,
+          jobMeta: currentJobMeta,
+          docType: "coverLetter",
+          doc,
+        });
+      }
+    }
+
+    await refreshDocsList();
+  }
+
+  function downloadHtmlAsFile(htmlString, filename) {
+    const blob = new Blob([htmlString], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  function buildAiFilename(kind, ext) {
+    const company = safeFilePart(currentJobMeta && currentJobMeta.company);
+    const title = safeFilePart(currentJobMeta && currentJobMeta.title);
+    const date = isoDatePart(new Date().toISOString());
+    const parts = [company, title, date, kind].filter(Boolean);
+    const base = parts.length > 1 ? parts.join("-") : (date + "-" + kind);
+    return base + "." + ext;
+  }
+
+  function genId() {
+    return (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : ("doc_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8));
   }
 
   // ---- Render helpers ----

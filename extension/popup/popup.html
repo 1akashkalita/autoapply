@@ -30,6 +30,9 @@
       <button id="btnFill" class="btn btn-primary" disabled>
         <span class="btn-icon">&#9998;</span> Fill Fields
       </button>
+      <button id="btnAiOptimize" class="btn btn-ai" disabled title="Enable LLM in Options to use AI Optimize">
+        <span class="btn-icon">&#9889;</span> AI Optimize
+      </button>
     </section>
 
     <!-- Job Documents -->
@@ -80,6 +83,29 @@
       <div id="resultList" class="result-list"></div>
     </section>
 
+    <!-- AI Optimize results (hidden by default) -->
+    <section id="aiSection" class="section hidden">
+      <div class="section-header">
+        <h2 class="section-title">AI Optimize</h2>
+      </div>
+      <div id="aiStatus" class="ai-status"></div>
+
+      <div id="aiGapSection" class="hidden">
+        <h3 class="subsection-title">Requirements Gap Analysis</h3>
+        <div id="aiGapList" class="gap-list"></div>
+      </div>
+
+      <div id="aiDiffSection" class="hidden">
+        <h3 class="subsection-title">Resume Changes</h3>
+        <div id="aiResumeDiff" class="diff-list"></div>
+      </div>
+
+      <div id="aiCoverLetterSection" class="hidden">
+        <h3 class="subsection-title">Generated Cover Letter</h3>
+        <textarea id="aiCoverLetter" rows="8" readonly></textarea>
+      </div>
+    </section>
+
     <!-- Footer -->
     <footer class="footer">
       <span id="adapterName" class="text-muted"></span>
@@ -87,6 +113,7 @@
     </footer>
   </div>
 
+  <script src="../shared/resume_html_builder.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

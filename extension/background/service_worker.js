@@ -16,6 +16,7 @@ const STORAGE_KEYS = {
   API_KEY: "jaf_openai_key",
   LLM_ENABLED: "jaf_llm_enabled",
   LAST_FILL_LOG: "jaf_last_fill_log",
+  STYLE_PROFILE: "jaf_style_profile",
 };
 
 // Storage sizing/retention (chrome.storage.local is quota-limited; keep it bounded)
@@ -142,6 +143,23 @@ async function saveLog(log) {
   await chrome.storage.local.set({ [STORAGE_KEYS.LAST_FILL_LOG]: log });
 }
 
+const DEFAULT_STYLE_PROFILE =
+  "Tone: direct, technical, not overly formal. No buzzwords like \"passionate\" or \"leverage\".\n" +
+  "Length: 3 short paragraphs max.\n" +
+  "Always mention: my competitive programming background when relevant to problem-solving roles.\n" +
+  "Never mention: salary expectations, references to being a fast learner.\n" +
+  'Opening style: lead with a specific thing about the company or role, not "I am writing to apply for".\n' +
+  'Closing style: one confident sentence, no "thank you for your consideration" filler.';
+
+async function getStyleProfile() {
+  const result = await chrome.storage.local.get(STORAGE_KEYS.STYLE_PROFILE);
+  return result[STORAGE_KEYS.STYLE_PROFILE] || DEFAULT_STYLE_PROFILE;
+}
+
+async function saveStyleProfile(text) {
+  await chrome.storage.local.set({ [STORAGE_KEYS.STYLE_PROFILE]: text });
+}
+
 // ---- LLM field mapping (optional) -----------------------------------------
 
 const FIELD_MAP_PROMPT =
@@ -215,6 +233,321 @@ async function llmMapFields(unmatchedFields, profile, resume, apiKey) {
   }
 }
 
+// ---- AI Resume Optimizer prompts & helpers ---------------------------------
+
+const JD_ANALYSIS_PROMPT =
+  "ROLE: You are a precise job description parser.\n\n" +
+  "TASK: Extract structured data from the job description the user provides.\n\n" +
+  "INPUT FORMAT:\n" +
+  "The user message contains the full text of a job description.\n\n" +
+  "OUTPUT FORMAT:\n" +
+  "Return ONLY valid JSON with this exact schema (every key is required):\n" +
+  "{\n" +
+  '  "role": string — job title exactly as written,\n' +
+  '  "company": string — company name, or "Unknown",\n' +
+  '  "location": string — city/state, "Remote", "Hybrid", or "Unknown",\n' +
+  '  "hard_skills": array — technical skills EXPLICITLY named (never inferred); [] if none,\n' +
+  '  "soft_skills": array — soft skills or traits EXPLICITLY named; [] if none,\n' +
+  '  "key_responsibilities": array — top 4-6 responsibilities as concise action phrases,\n' +
+  '  "required_qualifications": array — must-have qualifications; [] if none listed,\n' +
+  '  "preferred_qualifications": array — nice-to-have qualifications; [] if none listed,\n' +
+  '  "keywords": array — terms that appear multiple times or carry obvious weight,\n' +
+  '  "tone": string — exactly one of: technical | startup | corporate | research | creative,\n' +
+  '  "domain": string — exactly one of: backend | frontend | fullstack | ML/AI | data | infra | research | general SWE | other,\n' +
+  '  "notes": string — visa sponsorship, clearance, team details, etc.; "" if nothing notable\n' +
+  "}\n\n" +
+  "RULES:\n" +
+  "- Every key listed above must be present in the output.\n" +
+  "- Array fields must always be arrays, never null or a string.\n" +
+  '- "tone" and "domain" must be one of the allowed values exactly; choose the closest match.\n' +
+  "- Do not infer or fabricate information not present in the JD.\n\n" +
+  "IMPORTANT: Return ONLY valid JSON matching the schema above — no markdown fences, no commentary, no extra keys.";
+
+const JD_ANALYSIS_REQUIRED_KEYS = [
+  "role", "company", "location", "hard_skills", "soft_skills",
+  "key_responsibilities", "required_qualifications", "preferred_qualifications",
+  "keywords", "tone", "domain", "notes",
+];
+
+const RESUME_TAILOR_PROMPT =
+  "ROLE: You are an expert resume writer and ATS optimization specialist.\n\n" +
+  "TASK: Produce a tailored version of the resume JSON that maximizes ATS match rate for the given job description analysis.\n\n" +
+  "INPUT FORMAT:\n" +
+  "The user message contains:\n" +
+  "1. MASTER RESUME: the applicant's full resume in JSON format\n" +
+  "2. JOB DESCRIPTION ANALYSIS: structured JD data with keywords, requirements, skills\n\n" +
+  "OUTPUT FORMAT:\n" +
+  'Return ONLY valid JSON with two top-level keys: "tailored_resume" and "requirements_gaps".\n' +
+  '"tailored_resume" must have the EXACT same schema as the master resume.\n' +
+  '"requirements_gaps" is an array where each item is:\n' +
+  '{ "requirement": string, "status": "met"|"partially_met"|"not_met"|"filled_by_generated_project", "notes": string }\n\n' +
+  "RULES:\n" +
+  "- Never invent work experience, employers, job titles, or dates.\n" +
+  "- Rewrite bullet point text to mirror the JD's keywords and language where honest.\n" +
+  "- Reorder bullets within each job/project so the most JD-relevant ones come first.\n" +
+  "- Max 3-4 bullets per job entry to keep the resume to one page.\n" +
+  "- Select the 3 most relevant projects from the master resume for this role.\n" +
+  "- Add JD hard_skills to the skills section ONLY if they already exist somewhere in the master resume.\n" +
+  "- Keep the exact same JSON schema as the master resume.\n" +
+  "- For each required_qualification, check if the resume addresses it. If not, find the closest honest rewrite of an existing bullet that covers it.\n" +
+  "- SYNTHETIC PROJECT RULE: If a required skill/qualification cannot be covered by any existing experience or project, identify the weakest/least-relevant existing project, REPLACE it with a new generated project that:\n" +
+  "  (a) Uses only technologies the applicant has demonstrably used elsewhere in the resume\n" +
+  "  (b) Directly targets the uncovered requirement with a realistic, specific scope\n" +
+  "  (c) Includes 3 bullet points with plausible outcomes/metrics consistent with a student/early-career engineer\n" +
+  '  (d) Is marked with "generated": true in the project object\n' +
+  '  Set the corresponding gap status to "filled_by_generated_project".\n\n' +
+  "IMPORTANT: Return ONLY valid JSON matching the schema above — no markdown fences, no commentary, no extra keys.";
+
+const COVER_LETTER_PROMPT =
+  "ROLE: You are a cover letter writer. You write in the voice of the applicant based on their style profile. You produce cover letters that feel human, specific, and direct.\n\n" +
+  "TASK: Write a cover letter for the given job based on the applicant's resume and style preferences.\n\n" +
+  "INPUT FORMAT:\n" +
+  "The user message contains:\n" +
+  "1. STYLE PROFILE: the applicant's writing preferences and constraints\n" +
+  "2. RESUME SUMMARY: the applicant's resume in JSON format\n" +
+  "3. JOB DESCRIPTION ANALYSIS: structured JD data\n\n" +
+  "OUTPUT FORMAT:\n" +
+  "Return ONLY the cover letter text — no subject line, no date, no address block, no markdown formatting.\n\n" +
+  "RULES:\n" +
+  "- Follow the style profile strictly.\n" +
+  "- 2-3 paragraphs maximum. Never exceed 3 paragraphs.\n" +
+  "- Reference specific things from the job description (company name, role, 1-2 responsibilities).\n" +
+  "- Pull 2 relevant experience callouts from the resume — be specific, use numbers if available.\n" +
+  '- Do not use hollow phrases: "passionate", "excited to", "leverage", "synergy", "team player".\n' +
+  "- Do not restate the resume — the letter adds context the resume cannot.\n" +
+  "- Opening: lead with something specific about the company or role.\n" +
+  '- Closing: one confident sentence. No "thank you for your consideration" filler.\n\n' +
+  "IMPORTANT: Return ONLY the cover letter text, nothing else.";
+
+/**
+ * Shared OpenAI API wrapper — single source of truth for model config,
+ * format enforcement, parsing, validation, and retry logic.
+ */
+async function callOpenAi({ systemPrompt, userContent, apiKey, expectJson, requiredKeys, temperature }) {
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userContent },
+  ];
+
+  async function doFetch(msgs, temp) {
+    const body = {
+      model: "gpt-4o-mini",
+      temperature: temp,
+      messages: msgs,
+    };
+    if (expectJson) {
+      body.response_format = { type: "json_object" };
+    }
+
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + apiKey,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error("OpenAI API error " + resp.status + ": " + errText.substring(0, 300));
+    }
+
+    const data = await resp.json();
+    return data.choices[0].message.content.trim();
+  }
+
+  const raw = await doFetch(messages, temperature);
+  const cleaned = stripMarkdownFences(raw);
+
+  if (!expectJson) {
+    return cleaned;
+  }
+
+  // Parse JSON and validate
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (parseErr) {
+    console.warn("[JobAutofill] callOpenAi: JSON parse failed, retrying. Raw:", cleaned.substring(0, 300));
+    // Retry once with correction message at temperature 0
+    const retryMessages = [
+      ...messages,
+      { role: "assistant", content: raw },
+      { role: "user", content: "Your previous response was invalid JSON. Error: " + parseErr.message + ". Please output ONLY valid JSON matching the schema." },
+    ];
+    const retryRaw = await doFetch(retryMessages, 0.0);
+    const retryCleaned = stripMarkdownFences(retryRaw);
+    parsed = JSON.parse(retryCleaned);
+  }
+
+  // Validate required keys
+  if (requiredKeys && requiredKeys.length > 0) {
+    const missing = requiredKeys.filter((k) => !(k in parsed));
+    if (missing.length > 0) {
+      console.warn("[JobAutofill] callOpenAi: missing keys:", missing, "— retrying");
+      const retryMessages = [
+        ...messages,
+        { role: "assistant", content: raw },
+        { role: "user", content: "Your response is missing required keys: " + missing.join(", ") + ". Please output the complete JSON with ALL required keys." },
+      ];
+      const retryRaw = await doFetch(retryMessages, 0.0);
+      const retryCleaned = stripMarkdownFences(retryRaw);
+      const retryParsed = JSON.parse(retryCleaned);
+      const stillMissing = requiredKeys.filter((k) => !(k in retryParsed));
+      if (stillMissing.length > 0) {
+        throw new Error("LLM response still missing keys after retry: " + stillMissing.join(", "));
+      }
+      return retryParsed;
+    }
+  }
+
+  return parsed;
+}
+
+async function analyzeJd(jdText, apiKey) {
+  return await callOpenAi({
+    systemPrompt: JD_ANALYSIS_PROMPT,
+    userContent: jdText,
+    apiKey,
+    expectJson: true,
+    requiredKeys: JD_ANALYSIS_REQUIRED_KEYS,
+    temperature: 0.1,
+  });
+}
+
+async function tailorResume(masterResume, jdAnalysis, apiKey) {
+  const userContent =
+    "MASTER RESUME:\n" + JSON.stringify(masterResume, null, 2) + "\n\n" +
+    "JOB DESCRIPTION ANALYSIS:\n" + JSON.stringify(jdAnalysis, null, 2) + "\n\n" +
+    "Produce the tailored resume JSON now.";
+
+  return await callOpenAi({
+    systemPrompt: RESUME_TAILOR_PROMPT,
+    userContent,
+    apiKey,
+    expectJson: true,
+    requiredKeys: ["tailored_resume", "requirements_gaps"],
+    temperature: 0.2,
+  });
+}
+
+async function generateCoverLetterText(masterResume, jdAnalysis, styleProfile, apiKey) {
+  const userContent =
+    "STYLE PROFILE:\n" + styleProfile + "\n\n" +
+    "RESUME SUMMARY:\n" + JSON.stringify(masterResume, null, 2) + "\n\n" +
+    "JOB DESCRIPTION ANALYSIS:\n" + JSON.stringify(jdAnalysis, null, 2) + "\n\n" +
+    "Write the cover letter now.";
+
+  const text = await callOpenAi({
+    systemPrompt: COVER_LETTER_PROMPT,
+    userContent,
+    apiKey,
+    expectJson: false,
+    temperature: 0.5,
+  });
+
+  // Validate paragraph count — if > 3 paragraphs, trim to 3
+  const paragraphs = text.split(/\n\s*\n/).filter((p) => p.trim().length > 0);
+  if (paragraphs.length > 3) {
+    return paragraphs.slice(0, 3).join("\n\n");
+  }
+  return text;
+}
+
+function computeResumeDiff(original, tailored) {
+  const diff = [];
+  for (const sectionKey of ["experience", "projects"]) {
+    const origItems = original[sectionKey] || [];
+    const tailItems = tailored[sectionKey] || [];
+    const origById = {};
+    for (const item of origItems) {
+      if (item.id) origById[item.id] = item;
+    }
+
+    for (const tailItem of tailItems) {
+      const origItem = tailItem.id ? origById[tailItem.id] : null;
+      const isGenerated = tailItem.generated === true;
+
+      const header = sectionKey === "experience"
+        ? (tailItem.title || "") + " @ " + (tailItem.company || "")
+        : (tailItem.name || tailItem.id || "Unknown");
+
+      const entry = { section: sectionKey, header, generated: isGenerated, bullets: [] };
+
+      const origBulletsById = {};
+      if (origItem) {
+        for (const b of (origItem.bullets || [])) {
+          if (b.id) origBulletsById[b.id] = b.text;
+        }
+      }
+
+      for (const bullet of (tailItem.bullets || [])) {
+        const origText = bullet.id ? origBulletsById[bullet.id] : undefined;
+        const newText = bullet.text || "";
+
+        if (origText === undefined) {
+          entry.bullets.push({ type: "added", newText });
+        } else if (origText === newText) {
+          entry.bullets.push({ type: "unchanged", newText });
+        } else {
+          entry.bullets.push({ type: "changed", origText, newText });
+        }
+      }
+
+      if (isGenerated || entry.bullets.some((b) => b.type !== "unchanged")) {
+        diff.push(entry);
+      }
+    }
+  }
+  return diff;
+}
+
+async function handleGenerateAiDocuments(msg) {
+  const apiKey = await getApiKey();
+  if (!apiKey) {
+    return { ok: false, error: "No OpenAI API key configured. Set it in Options." };
+  }
+  const llmOn = await isLlmEnabled();
+  if (!llmOn) {
+    return { ok: false, error: "LLM is disabled. Enable it in Options." };
+  }
+
+  const resume = await getResume();
+  if (!resume) {
+    return { ok: false, error: "No resume JSON configured. Upload it in Options." };
+  }
+
+  const jdText = msg.jdText;
+  if (!jdText || jdText.trim().length < 30) {
+    return { ok: false, error: "Could not extract job description text from this page." };
+  }
+
+  const styleProfile = await getStyleProfile();
+
+  // Step 1: Analyze JD
+  const jdAnalysis = await analyzeJd(jdText, apiKey);
+
+  // Step 2 & 3: Tailor resume and generate cover letter in parallel
+  const [tailorResult, coverLetterText] = await Promise.all([
+    tailorResume(resume, jdAnalysis, apiKey),
+    generateCoverLetterText(resume, jdAnalysis, styleProfile, apiKey),
+  ]);
+
+  const tailoredResume = tailorResult.tailored_resume || tailorResult;
+  const requirementsGaps = tailorResult.requirements_gaps || [];
+  const diff = computeResumeDiff(resume, tailoredResume);
+
+  return {
+    ok: true,
+    tailoredResume,
+    coverLetterText,
+    jdAnalysis,
+    requirementsGaps,
+    diff,
+  };
+}
+
 // ---- Message handler -------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -256,6 +589,7 @@ async function handleMessage(msg, sender) {
           : null,
         apiKey: await getApiKey(),
         llmEnabled: await isLlmEnabled(),
+        styleProfile: await getStyleProfile(),
       };
 
     case "saveSettings":
@@ -335,6 +669,16 @@ async function handleMessage(msg, sender) {
 
     case "confirmFill":
       return await handleConfirmFill(msg);
+
+    case "generateAiDocuments":
+      return await handleGenerateAiDocuments(msg);
+
+    case "getStyleProfile":
+      return { ok: true, styleProfile: await getStyleProfile() };
+
+    case "saveStyleProfile":
+      await saveStyleProfile(msg.styleProfile || "");
+      return { ok: true };
 
     default:
       return { ok: false, error: "unknown action: " + msg.action };

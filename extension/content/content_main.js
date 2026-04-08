@@ -98,9 +98,130 @@ window.JobAutofill = window.JobAutofill || {};
     return parts.join("|") + "|" + urlHash;
   }
 
-  /**
-   * Handle messages from the background service worker / popup.
-   */
+  // ---- JD Extraction --------------------------------------------------------
+
+  var ATS_SIGNAL_WORDS = [
+    "requirements", "responsibilities", "qualifications", "you will",
+    "we're looking for", "we are looking for", "what you'll do",
+    "what you will do", "about the role", "about this role",
+    "job description", "who you are", "must have", "nice to have",
+    "preferred", "minimum qualifications", "basic qualifications",
+  ];
+
+  var KNOWN_JD_SELECTORS = [
+    // Jobright
+    '[class*="job-description"]', '[class*="jd-"]',
+    // LinkedIn
+    '.jobs-description__content', '.jobs-description-content',
+    // Greenhouse
+    '#content .job-description', '#app_body .job-description',
+    // Lever
+    '.section-wrapper .content', '.posting-categories + div',
+    // Workday
+    '[data-automation-id="jobPostingDescription"]',
+  ];
+
+  var GENERIC_JD_SELECTORS = [
+    '[class*="job-desc"]', '[id*="job-desc"]',
+    '[class*="jobDescription"]', '[id*="jobDescription"]',
+    '[class*="description"]', '[data-testid*="description"]',
+    'article', 'main', '[role="main"]',
+  ];
+
+  function countSignalWords(text) {
+    var lower = text.toLowerCase();
+    var count = 0;
+    for (var i = 0; i < ATS_SIGNAL_WORDS.length; i++) {
+      if (lower.indexOf(ATS_SIGNAL_WORDS[i]) !== -1) count++;
+    }
+    return count;
+  }
+
+  function getCleanText(el) {
+    return (el.innerText || el.textContent || "").trim();
+  }
+
+  function wordCount(text) {
+    return text.split(/\s+/).filter(Boolean).length;
+  }
+
+  function scoreCandidate(el) {
+    var text = getCleanText(el);
+    var wc = wordCount(text);
+    if (wc < 50) return -1;
+    var signals = countSignalWords(text);
+    if (signals < 2) return -1;
+    return wc + (signals * 200);
+  }
+
+  function extractJobDescription() {
+    var method = "none";
+    var text = "";
+
+    // Tier 1: Known job board selectors
+    for (var i = 0; i < KNOWN_JD_SELECTORS.length; i++) {
+      var el = document.querySelector(KNOWN_JD_SELECTORS[i]);
+      if (!el) continue;
+      var t = getCleanText(el);
+      if (wordCount(t) >= 50) {
+        text = t;
+        method = "known_selector";
+        break;
+      }
+    }
+
+    // Tier 2: Generic career page selectors, scored
+    if (!text) {
+      var bestScore = -1;
+      var bestText = "";
+      for (var j = 0; j < GENERIC_JD_SELECTORS.length; j++) {
+        var els = document.querySelectorAll(GENERIC_JD_SELECTORS[j]);
+        for (var k = 0; k < els.length; k++) {
+          var s = scoreCandidate(els[k]);
+          if (s > bestScore) {
+            bestScore = s;
+            bestText = getCleanText(els[k]);
+          }
+        }
+      }
+      if (bestText) {
+        text = bestText;
+        method = "generic_selector";
+      }
+    }
+
+    // Tier 3: Full DOM walk
+    if (!text) {
+      var candidates = document.querySelectorAll("section, div");
+      var bestScore2 = -1;
+      var bestText2 = "";
+      for (var n = 0; n < candidates.length; n++) {
+        var s2 = scoreCandidate(candidates[n]);
+        if (s2 > bestScore2) {
+          bestScore2 = s2;
+          bestText2 = getCleanText(candidates[n]);
+        }
+      }
+      if (bestText2) {
+        text = bestText2;
+        method = "dom_walk";
+      }
+    }
+
+    // Cap at ~15000 chars to stay within token budget
+    if (text.length > 15000) {
+      text = text.substring(0, 15000);
+    }
+
+    return {
+      jdText: text,
+      wordCount: wordCount(text),
+      extractionMethod: method,
+    };
+  }
+
+  // ---- Message handler ------------------------------------------------------
+
   chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     if (!msg || !msg.action) return false;
 
@@ -130,6 +251,20 @@ window.JobAutofill = window.JobAutofill || {};
         try {
           var meta = extractJobMeta();
           sendResponse({ ok: true, jobMeta: meta, jobKey: buildJobKey(meta) });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e) });
+        }
+        return false;
+
+      case "extractJobDescription":
+        try {
+          var jdResult = extractJobDescription();
+          sendResponse({
+            ok: true,
+            jdText: jdResult.jdText,
+            wordCount: jdResult.wordCount,
+            extractionMethod: jdResult.extractionMethod,
+          });
         } catch (e) {
           sendResponse({ ok: false, error: String(e) });
         }
