@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .DS_Store
 node_modules/
+resume_tool/data/master_resume.json
+resume_tool/data/applicant_data.json

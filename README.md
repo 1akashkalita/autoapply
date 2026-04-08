@@ -31,8 +31,8 @@
 ### 2️⃣ Set Up Your Profile
 
 1. Click the extension icon → **Edit Profile & Settings**
-2. Fill in your info manually, or paste your `applicant_data.json`
-3. 📄 Paste your `master_resume.json` in the **Resume Data** section
+2. Fill in your info manually, or paste JSON that matches the `applicant_data.json` schema (that filename is **gitignored** in the repo; see **Resume Tool** below for the CLI layout)
+3. 📄 Paste resume JSON (`master_resume.json` shape) in the **Resume Data** section — same local-only convention as the CLI
 4. 🔑 Add your **OpenAI API key** and enable LLM
 5. Click **Save**
 
@@ -179,8 +179,8 @@ jobautofill/
     ├── cover_letter.py
     ├── resume_renderer.py
     └── data/
-        ├── master_resume.json
-        ├── applicant_data.json
+        ├── master_resume.json      ← local only (.gitignore)
+        ├── applicant_data.json     ← local only (.gitignore)
         └── style_profile.txt
 ```
 
@@ -246,12 +246,15 @@ The extension generates print-ready HTML files using the exact same CSS as the P
 - 🖨️ PDF rendering → `resume_renderer.py`
 - 🤖 Playwright autofill experiments → `autofill_agent.py`
 
+**Private data files:** `resume_tool/data/master_resume.json` and `resume_tool/data/applicant_data.json` are listed in `.gitignore` so they are never committed. After cloning the repo, create them locally (copy from a backup, export from the extension Options page, or restore from an old commit with `git show <commit>:resume_tool/data/applicant_data.json`). `style_profile.txt` remains in the repo as non-sensitive sample text.
+
 ```bash
 cd resume_tool
 pip install -r requirements.txt
 playwright install chromium
 cp .env.example .env
 # Edit .env with your OpenAI API key
+# Ensure data/master_resume.json and data/applicant_data.json exist locally
 python run.py
 ```
 
