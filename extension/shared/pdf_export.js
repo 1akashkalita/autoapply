@@ -9,6 +9,12 @@ window.JobAutofill = window.JobAutofill || {};
 (function () {
   var JA = window.JobAutofill;
 
+  function escapeHtml(text) {
+    var div = document.createElement("div");
+    div.textContent = String(text || "");
+    return div.innerHTML;
+  }
+
   function sendBg(msg) {
     return new Promise(function (resolve) {
       chrome.runtime.sendMessage(msg, function (resp) {
@@ -60,6 +66,16 @@ window.JobAutofill = window.JobAutofill || {};
       throw new Error(resp && resp.error ? resp.error : "PDF render failed");
     }
     return resp.doc;
+  };
+
+  JA.renderCoverLetterPdfDoc = async function (coverLetterText, jobMeta, personal, filename, options) {
+    var html;
+    if (JA.buildCoverLetterHtml) {
+      html = await JA.buildCoverLetterHtml(coverLetterText, jobMeta, personal);
+    } else {
+      html = "<pre>" + escapeHtml(coverLetterText || "") + "</pre>";
+    }
+    return await JA.renderPdfFromHtml(html, filename || "cover-letter.pdf", options);
   };
 
   JA.downloadPdfFromHtml = async function (html, filename, options) {

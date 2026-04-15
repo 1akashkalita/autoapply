@@ -769,12 +769,9 @@ window.JobAutofill = window.JobAutofill || {};
       if (!text) { setDocsStatus("Paste cover letter text first.", false); return; }
       if (!currentJobKey) { setDocsStatus("No job detected for this tab yet.", false); return; }
       var personal = await getCurrentPersonalInfo();
-      var clHtml = JA.buildCoverLetterHtml
-        ? JA.buildCoverLetterHtml(text, currentJobMeta, personal)
-        : "<pre>" + escHtml(text) + "</pre>";
       var doc;
       try {
-        doc = await JA.renderPdfFromHtml(clHtml, buildAiFilename("cover-letter", "pdf"));
+        doc = await JA.renderCoverLetterPdfDoc(text, currentJobMeta, personal, buildAiFilename("cover-letter", "pdf"));
       } catch (err) {
         setDocsStatus("PDF export failed: " + String(err), false);
         return;
@@ -932,21 +929,27 @@ window.JobAutofill = window.JobAutofill || {};
       setStatus("\ud83d\udfe2 Done", "success");
       $.btnCoverLetter.disabled = false;
 
-      if (currentJobKey && result.coverLetterText) {
+      if (result.coverLetterText) {
         var personal = (result.activeResume && result.activeResume.personal) ? result.activeResume.personal : await getCurrentPersonalInfo();
-        var clHtml = JA.buildCoverLetterHtml ? JA.buildCoverLetterHtml(result.coverLetterText, currentJobMeta, personal) : null;
-        if (clHtml) {
-          try {
-            var pdfDoc = await JA.renderPdfFromHtml(clHtml, buildAiFilename("cover-letter", "pdf"));
+        try {
+          var pdfDoc = await JA.renderCoverLetterPdfDoc(
+            result.coverLetterText,
+            currentJobMeta,
+            personal,
+            buildAiFilename("cover-letter", "pdf")
+          );
+          pdfDoc.createdAt = new Date().toISOString();
+          JA.downloadBase64File(pdfDoc.dataBase64, pdfDoc.name, pdfDoc.mime);
+          if (currentJobKey) {
             await sendBg({
               action: "saveJobDocument", jobKey: currentJobKey, jobMeta: currentJobMeta,
               docType: "coverLetter",
               doc: pdfDoc,
             });
             await refreshDocsList();
-          } catch (pdfErr) {
-            showCoverLetterError("Cover letter generated, but PDF archive save failed: " + String(pdfErr));
           }
+        } catch (pdfErr) {
+          showCoverLetterError("Cover letter generated, but PDF export failed: " + String(pdfErr));
         }
       }
     });
@@ -955,11 +958,8 @@ window.JobAutofill = window.JobAutofill || {};
       var text = $.standaloneCoverLetter ? $.standaloneCoverLetter.value : lastCoverLetterText;
       if (!text) return;
       var personal = await getCurrentPersonalInfo();
-      var clHtml = JA.buildCoverLetterHtml
-        ? JA.buildCoverLetterHtml(text, currentJobMeta, personal)
-        : "<pre>" + escHtml(text) + "</pre>";
       try {
-        var doc = await JA.renderPdfFromHtml(clHtml, buildAiFilename("cover-letter", "pdf"));
+        var doc = await JA.renderCoverLetterPdfDoc(text, currentJobMeta, personal, buildAiFilename("cover-letter", "pdf"));
         JA.downloadBase64File(doc.dataBase64, doc.name, doc.mime);
       } catch (pdfErr) {
         showCoverLetterError("PDF export failed: " + String(pdfErr));
@@ -1346,7 +1346,10 @@ window.JobAutofill = window.JobAutofill || {};
         if (entry.generated) diffHtml += ' <span class="diff-generated-badge">Generated</span>';
         diffHtml += '</div>';
         (entry.bullets || []).forEach(function (b) {
-          if (b.type === "changed") {
+          if (b.type === "headline_changed") {
+            diffHtml += '<div class="diff-line diff-removed">Headline: ' + escHtml(truncate(b.origText, 140)) + '</div>' +
+              '<div class="diff-line diff-added">Headline: ' + escHtml(truncate(b.newText, 140)) + '</div>';
+          } else if (b.type === "changed") {
             diffHtml += '<div class="diff-line diff-removed">&minus; ' + escHtml(truncate(b.origText, 140)) + '</div>' +
               '<div class="diff-line diff-added">&plus; ' + escHtml(truncate(b.newText, 140)) + '</div>';
           } else if (b.type === "added") {
@@ -1383,9 +1386,13 @@ window.JobAutofill = window.JobAutofill || {};
       }
     }
 
-    if (result.coverLetterText && JA.buildCoverLetterHtml && JA.renderPdfFromHtml) {
-      var clHtml = JA.buildCoverLetterHtml(result.coverLetterText, currentJobMeta, personal);
-      var clDoc  = await JA.renderPdfFromHtml(clHtml, buildAiFilename("cover-letter", "pdf"));
+    if (result.coverLetterText && JA.renderCoverLetterPdfDoc) {
+      var clDoc = await JA.renderCoverLetterPdfDoc(
+        result.coverLetterText,
+        currentJobMeta,
+        personal,
+        buildAiFilename("cover-letter", "pdf")
+      );
       clDoc.createdAt = now;
       JA.downloadBase64File(clDoc.dataBase64, clDoc.name, clDoc.mime);
       if (currentJobKey) {

@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cover Letter - {{APPLICANT_NAME}}</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;1,400&family=DM+Sans:wght@300;400;500&display=swap');
+
+    @page {
+      size: letter;
+      margin: 0;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #f5f3ee;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      min-height: 100vh;
+      padding: 48px 24px;
+      font-family: "DM Sans", Arial, Helvetica, sans-serif;
+    }
+
+    .page {
+      background: #fffef9;
+      width: 680px;
+      min-height: 900px;
+      padding: 64px 72px;
+      border: 0.5px solid #dedad2;
+      position: relative;
+    }
+
+    .page::before {
+      content: "";
+      display: block;
+      width: 48px;
+      height: 2px;
+      background: #1a1a1a;
+      margin-bottom: 40px;
+    }
+
+    .header {
+      margin-bottom: 48px;
+    }
+
+    .applicant-name {
+      font-family: "EB Garamond", Georgia, "Times New Roman", serif;
+      font-size: 28px;
+      font-weight: 500;
+      color: #1a1a1a;
+      letter-spacing: -0.3px;
+      margin-bottom: 6px;
+    }
+
+    .applicant-meta {
+      font-size: 13px;
+      font-weight: 300;
+      color: #6b6760;
+      letter-spacing: 0.3px;
+      line-height: 1.8;
+    }
+
+    .applicant-meta:empty,
+    .meta-line:empty,
+    .recipient:empty,
+    .recipient-detail:empty,
+    .recipient-detail-line:empty,
+    .body:empty {
+      display: none;
+    }
+
+    .applicant-meta a {
+      color: #6b6760;
+      text-decoration: none;
+      border-bottom: 0.5px solid #c5c2bb;
+    }
+
+    .divider {
+      border: none;
+      border-top: 0.5px solid #dedad2;
+      margin: 32px 0;
+    }
+
+    .date {
+      font-size: 13px;
+      color: #8a8780;
+      font-weight: 300;
+      margin-bottom: 28px;
+      letter-spacing: 0.2px;
+    }
+
+    .recipient {
+      margin-bottom: 36px;
+    }
+
+    .recipient-name {
+      font-size: 14px;
+      font-weight: 500;
+      color: #1a1a1a;
+      margin-bottom: 2px;
+    }
+
+    .recipient-detail {
+      font-size: 13px;
+      font-weight: 300;
+      color: #6b6760;
+      line-height: 1.8;
+    }
+
+    .salutation {
+      font-family: "EB Garamond", Georgia, "Times New Roman", serif;
+      font-size: 16px;
+      color: #1a1a1a;
+      margin-bottom: 20px;
+    }
+
+    .body p {
+      font-family: "EB Garamond", Georgia, "Times New Roman", serif;
+      font-size: 16px;
+      line-height: 1.85;
+      color: #2a2926;
+      margin-bottom: 20px;
+    }
+
+    .body p:last-child {
+      margin-bottom: 0;
+    }
+
+    .closing {
+      margin-top: 40px;
+    }
+
+    .closing-word {
+      font-family: "EB Garamond", Georgia, "Times New Roman", serif;
+      font-size: 16px;
+      color: #1a1a1a;
+      margin-bottom: 36px;
+    }
+
+    .signature {
+      font-family: "EB Garamond", Georgia, "Times New Roman", serif;
+      font-size: 18px;
+      font-weight: 500;
+      font-style: italic;
+      color: #1a1a1a;
+      margin-bottom: 4px;
+    }
+
+    .signature-name {
+      font-family: "DM Sans", Arial, Helvetica, sans-serif;
+      font-size: 13px;
+      font-weight: 300;
+      color: #6b6760;
+      letter-spacing: 0.3px;
+    }
+
+    .footer-rule {
+      position: absolute;
+      bottom: 40px;
+      left: 72px;
+      right: 72px;
+      border: none;
+      border-top: 0.5px solid #dedad2;
+    }
+
+    @media print {
+      body {
+        background: white;
+        padding: 0;
+      }
+
+      .page {
+        border: none;
+        width: 100%;
+        min-height: 100vh;
+        padding: 60px 72px;
+        box-shadow: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div class="applicant-name">{{APPLICANT_NAME}}</div>
+      <div class="applicant-meta">{{APPLICANT_META_HTML}}</div>
+    </div>
+
+    <hr class="divider" />
+
+    <div class="date">{{DATE}}</div>
+
+    <div class="recipient">{{RECIPIENT_HTML}}</div>
+
+    <div class="salutation">{{SALUTATION_LINE}}</div>
+
+    <div class="body">
+      {{OPENING_PARAGRAPH_HTML}}
+      {{BODY_PARAGRAPH_1_HTML}}
+      {{BODY_PARAGRAPH_2_HTML}}
+      {{CLOSING_PARAGRAPH_HTML}}
+    </div>
+
+    <div class="closing">
+      <div class="closing-word">Sincerely,</div>
+      <div class="signature">{{APPLICANT_NAME}}</div>
+      <div class="signature-name">{{APPLICANT_NAME_PRINT}}</div>
+    </div>
+
+    <hr class="footer-rule" />
+  </div>
+</body>
+</html>

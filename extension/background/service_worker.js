@@ -906,31 +906,41 @@ const RESUME_PARSE_REQUIRED_KEYS = [
 
 const RESUME_TAILOR_PROMPT =
   "ROLE: You are an expert resume writer and ATS optimization specialist.\n\n" +
-  "TASK: Produce a tailored version of the resume JSON that maximizes ATS match rate for the given job description analysis.\n\n" +
+  "TASK: Produce candidate edits for ONLY the existing work experience and project experience sections so the final resume better matches the job description analysis.\n\n" +
   "INPUT FORMAT:\n" +
   "The user message contains:\n" +
   "1. MASTER RESUME: the applicant's full resume in JSON format\n" +
   "2. JOB DESCRIPTION ANALYSIS: structured JD data with keywords, requirements, skills\n\n" +
   "OUTPUT FORMAT:\n" +
-  'Return ONLY valid JSON with two top-level keys: "tailored_resume" and "requirements_gaps".\n' +
-  '"tailored_resume" must have the EXACT same schema as the master resume.\n' +
+  'Return ONLY valid JSON with two top-level keys: "candidate_edits" and "requirements_gaps".\n' +
+  '"candidate_edits" must have exactly this shape:\n' +
+  '{\n' +
+  '  "experience": [\n' +
+  '    {\n' +
+  '      "id": string,\n' +
+  '      "headline": string (optional, only when that same entry already has a headline),\n' +
+  '      "bullets": [ { "id": string, "text": string } ]\n' +
+  '    }\n' +
+  '  ],\n' +
+  '  "projects": [\n' +
+  '    {\n' +
+  '      "id": string,\n' +
+  '      "bullets": [ { "id": string, "text": string } ]\n' +
+  '    }\n' +
+  '  ]\n' +
+  '}\n' +
+  'Each array must reference ONLY existing resume entry ids and existing bullet ids from the master resume.\n' +
   '"requirements_gaps" is an array where each item is:\n' +
-  '{ "requirement": string, "status": "met"|"partially_met"|"not_met"|"filled_by_generated_project", "notes": string }\n\n' +
+  '{ "requirement": string, "status": "met"|"partially_met"|"not_met", "notes": string }\n\n' +
   "RULES:\n" +
   "- Never invent work experience, employers, job titles, or dates.\n" +
   "- Rewrite bullet point text to mirror the JD's keywords and language where honest.\n" +
-  "- Reorder bullets within each job/project so the most JD-relevant ones come first.\n" +
-  "- Max 3-4 bullets per job entry to keep the resume to one page.\n" +
-  "- Select the 3 most relevant projects from the master resume for this role.\n" +
-  "- Add JD hard_skills to the skills section ONLY if they already exist somewhere in the master resume.\n" +
-  "- Keep the exact same JSON schema as the master resume.\n" +
-  "- For each required_qualification, check if the resume addresses it. If not, find the closest honest rewrite of an existing bullet that covers it.\n" +
-  "- SYNTHETIC PROJECT RULE: If a required skill/qualification cannot be covered by any existing experience or project, identify the weakest/least-relevant existing project, REPLACE it with a new generated project that:\n" +
-  "  (a) Uses only technologies the applicant has demonstrably used elsewhere in the resume\n" +
-  "  (b) Directly targets the uncovered requirement with a realistic, specific scope\n" +
-  "  (c) Includes 3 bullet points with plausible outcomes/metrics consistent with a student/early-career engineer\n" +
-  '  (d) Is marked with "generated": true in the project object\n' +
-  '  Set the corresponding gap status to "filled_by_generated_project".\n\n' +
+  "- You MAY reorder bullets within an existing job/project entry by returning the same bullet ids in a different order.\n" +
+  "- You MAY update an experience headline ONLY if that exact resume entry already has a headline.\n" +
+  "- Do NOT change personal, education, skills, leadership, certifications, titles, companies, dates, locations, section order, entry order, or bullet ids.\n" +
+  "- Do NOT add or remove experience entries, projects, or bullets.\n" +
+  "- Do NOT create synthetic/generated projects.\n" +
+  "- If a requirement cannot be honestly addressed by rewriting existing experience/project bullets, leave it as not_met.\n\n" +
   "IMPORTANT: Return ONLY valid JSON matching the schema above — no markdown fences, no commentary, no extra keys.";
 
 const COVER_LETTER_PROMPT =
@@ -1147,14 +1157,14 @@ async function tailorResume(masterResume, jdAnalysis, apiKey, jobKey) {
   const userContent =
     "MASTER RESUME:\n" + JSON.stringify(masterResume, null, 2) + "\n\n" +
     "JOB DESCRIPTION ANALYSIS:\n" + JSON.stringify(jdAnalysis, null, 2) + "\n\n" +
-    "Produce the tailored resume JSON now.";
+    "Produce the candidate experience/project edits now.";
 
   return await callOpenAi({
     systemPrompt: RESUME_TAILOR_PROMPT,
     userContent,
     apiKey,
     expectJson: true,
-    requiredKeys: ["tailored_resume", "requirements_gaps"],
+    requiredKeys: ["candidate_edits", "requirements_gaps"],
     temperature: 0.2,
     operation: "tailorResume",
     model: DEFAULT_OPENAI_MODEL,
@@ -1200,13 +1210,23 @@ function computeResumeDiff(original, tailored) {
 
     for (const tailItem of tailItems) {
       const origItem = tailItem.id ? origById[tailItem.id] : null;
-      const isGenerated = tailItem.generated === true;
-
       const header = sectionKey === "experience"
         ? (tailItem.title || "") + " @ " + (tailItem.company || "")
         : (tailItem.name || tailItem.id || "Unknown");
 
-      const entry = { section: sectionKey, header, generated: isGenerated, bullets: [] };
+      const entry = { section: sectionKey, header, bullets: [] };
+
+      if (
+        sectionKey === "experience" &&
+        origItem &&
+        String(origItem.headline || "") !== String(tailItem.headline || "")
+      ) {
+        entry.bullets.push({
+          type: "headline_changed",
+          origText: String(origItem.headline || ""),
+          newText: String(tailItem.headline || ""),
+        });
+      }
 
       const origBulletsById = {};
       if (origItem) {
@@ -1228,12 +1248,90 @@ function computeResumeDiff(original, tailored) {
         }
       }
 
-      if (isGenerated || entry.bullets.some((b) => b.type !== "unchanged")) {
+      if (entry.bullets.some((b) => b.type !== "unchanged")) {
         diff.push(entry);
       }
     }
   }
   return diff;
+}
+
+function normalizeEditableBullets(bullets) {
+  if (!Array.isArray(bullets)) return [];
+  return bullets.map(function (bullet) {
+    if (typeof bullet === "string") return { text: bullet };
+    return cloneJson(bullet) || {};
+  });
+}
+
+function mergeEditableSectionItems(originalItems, candidateItems, allowHeadline) {
+  var candidateById = {};
+  (candidateItems || []).forEach(function (item) {
+    if (item && item.id) candidateById[item.id] = item;
+  });
+
+  return (originalItems || []).map(function (originalItem) {
+    var nextItem = cloneJson(originalItem) || {};
+    var candidate = originalItem && originalItem.id ? candidateById[originalItem.id] : null;
+    if (!candidate) return nextItem;
+
+    if (
+      allowHeadline &&
+      typeof nextItem.headline === "string" &&
+      typeof candidate.headline === "string" &&
+      candidate.headline.trim()
+    ) {
+      nextItem.headline = candidate.headline.trim();
+    }
+
+    var originalBullets = normalizeEditableBullets(originalItem.bullets || []);
+    if (!originalBullets.length) return nextItem;
+
+    var originalBulletsById = {};
+    originalBullets.forEach(function (bullet) {
+      if (bullet && bullet.id) originalBulletsById[bullet.id] = cloneJson(bullet);
+    });
+
+    var mergedBullets = [];
+    var seenBulletIds = {};
+
+    normalizeEditableBullets(candidate.bullets || []).forEach(function (candidateBullet) {
+      var bulletId = candidateBullet && candidateBullet.id;
+      if (!bulletId || !originalBulletsById[bulletId] || seenBulletIds[bulletId]) return;
+      var nextBullet = cloneJson(originalBulletsById[bulletId]);
+      var nextText = String(candidateBullet.text || "").trim();
+      if (nextText) nextBullet.text = nextText;
+      mergedBullets.push(nextBullet);
+      seenBulletIds[bulletId] = true;
+    });
+
+    originalBullets.forEach(function (originalBullet) {
+      var bulletId = originalBullet && originalBullet.id;
+      if (bulletId && seenBulletIds[bulletId]) return;
+      mergedBullets.push(cloneJson(originalBullet));
+    });
+
+    nextItem.bullets = mergedBullets;
+    return nextItem;
+  });
+}
+
+function applyTailorGuardrails(originalResume, candidateEdits) {
+  var frozenResume = cloneJson(originalResume) || {};
+  var edits = candidateEdits || {};
+
+  frozenResume.experience = mergeEditableSectionItems(
+    originalResume && originalResume.experience,
+    edits.experience,
+    true
+  );
+  frozenResume.projects = mergeEditableSectionItems(
+    originalResume && originalResume.projects,
+    edits.projects,
+    false
+  );
+
+  return frozenResume;
 }
 
 async function resolveActiveResumeContext(jobKey, options) {
@@ -1374,7 +1472,7 @@ async function handleGenerateAiDocuments(msg) {
     generateCoverLetterText(resume, jdAnalysis, styleProfile, apiKey, msg.jobKey),
   ]);
 
-  const tailoredResume = tailorResult.tailored_resume || tailorResult;
+  const tailoredResume = applyTailorGuardrails(resume, tailorResult.candidate_edits || {});
   const requirementsGaps = tailorResult.requirements_gaps || [];
   const diff = computeResumeDiff(resume, tailoredResume);
 
@@ -2131,7 +2229,7 @@ async function handleExecuteResumeOptimization(msg) {
     return { ok: false, error: "Optimization failed: " + (err.message || String(err)) };
   }
 
-  const tailoredResume = tailorResult.tailored_resume || tailorResult;
+  const tailoredResume = applyTailorGuardrails(resume, tailorResult.candidate_edits || {});
   const requirementsGaps = tailorResult.requirements_gaps || [];
   const diff = computeResumeDiff(resume, tailoredResume);
 

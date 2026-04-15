@@ -14,6 +14,8 @@ window.JobAutofill = window.JobAutofill || {};
 
 (function () {
   var JA = window.JobAutofill;
+  var COVER_LETTER_TEMPLATE_PATH = "shared/templates/cover_letter_template.html";
+  var coverLetterTemplatePromise = null;
 
   function esc(text) {
     var div = document.createElement("div");
@@ -204,49 +206,191 @@ window.JobAutofill = window.JobAutofill || {};
       "</body>\n</html>";
   };
 
-  var COVER_LETTER_CSS =
-    "@page { size: letter; margin: 1in; }\n" +
-    "* { margin: 0; padding: 0; box-sizing: border-box; }\n" +
-    'body { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; font-size: 11pt; line-height: 1.5; color: #111; }\n' +
-    "a { color: inherit; text-decoration: none; }\n" +
-    ".cl-header { text-align: center; margin-bottom: 24pt; }\n" +
-    ".cl-name { font-size: 18pt; font-weight: 700; letter-spacing: 0.03em; margin-bottom: 2pt; }\n" +
-    ".cl-contact { font-size: 9pt; color: #444; }\n" +
-    ".cl-date { margin-bottom: 18pt; font-size: 10pt; color: #444; }\n" +
-    ".cl-body p { margin-bottom: 12pt; text-align: justify; }\n" +
-    "@media print { body { -webkit-print-color-adjust: exact; } }";
+  function replaceTemplateTokens(template, values) {
+    return String(template || "").replace(/\{\{([A-Z0-9_]+)\}\}/g, function (_, key) {
+      return Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : "";
+    });
+  }
 
-  JA.buildCoverLetterHtml = function (coverLetterText, jobMeta, personal) {
+  function loadCoverLetterTemplate() {
+    if (coverLetterTemplatePromise) return coverLetterTemplatePromise;
+
+    var url = (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL)
+      ? chrome.runtime.getURL(COVER_LETTER_TEMPLATE_PATH)
+      : COVER_LETTER_TEMPLATE_PATH;
+
+    coverLetterTemplatePromise = fetch(url).then(function (response) {
+      if (!response.ok) {
+        throw new Error("Failed to load cover letter template: " + response.status);
+      }
+      return response.text();
+    }).catch(function (err) {
+      coverLetterTemplatePromise = null;
+      throw err;
+    });
+
+    return coverLetterTemplatePromise;
+  }
+
+  function splitCoverLetterParagraphs(coverLetterText) {
+    return String(coverLetterText || "")
+      .split(/\n\s*\n/)
+      .map(function (paragraph) { return paragraph.trim(); })
+      .filter(function (paragraph) { return paragraph; });
+  }
+
+  function splitParagraphIntoTwo(paragraph) {
+    var normalized = String(paragraph || "").replace(/\s+/g, " ").trim();
+    if (!normalized) return null;
+
+    var sentences = normalized.match(/[^.!?]+(?:[.!?]+|$)/g) || [];
+    sentences = sentences.map(function (sentence) { return sentence.trim(); }).filter(Boolean);
+    if (sentences.length < 2) return null;
+
+    var midpoint = Math.ceil(sentences.length / 2);
+    var firstHalf = sentences.slice(0, midpoint).join(" ").trim();
+    var secondHalf = sentences.slice(midpoint).join(" ").trim();
+    if (!firstHalf || !secondHalf) return null;
+    return [firstHalf, secondHalf];
+  }
+
+  function paragraphGroupsForTemplate(coverLetterText) {
+    var paragraphs = splitCoverLetterParagraphs(coverLetterText);
+    if (!paragraphs.length) {
+      return {
+        opening: [],
+        body1: [],
+        body2: [],
+        closing: [],
+      };
+    }
+
+    if (paragraphs.length > 4) {
+      return {
+        opening: [paragraphs[0]],
+        body1: [paragraphs[1]],
+        body2: paragraphs.slice(2, paragraphs.length - 1),
+        closing: [paragraphs[paragraphs.length - 1]],
+      };
+    }
+
+    var groups = paragraphs.map(function (paragraph) {
+      return [paragraph];
+    });
+
+    while (groups.length < 4) {
+      var splitIndex = -1;
+      var splitLength = -1;
+      for (var i = 0; i < groups.length; i++) {
+        var group = groups[i];
+        if (!group || group.length !== 1) continue;
+        if (!splitParagraphIntoTwo(group[0])) continue;
+        if (group[0].length > splitLength) {
+          splitLength = group[0].length;
+          splitIndex = i;
+        }
+      }
+
+      if (splitIndex === -1) break;
+      var splitPair = splitParagraphIntoTwo(groups[splitIndex][0]);
+      if (!splitPair) break;
+      groups.splice(splitIndex, 1, [splitPair[0]], [splitPair[1]]);
+    }
+
+    while (groups.length < 4) groups.push([]);
+
+    return {
+      opening: groups[0],
+      body1: groups[1],
+      body2: groups[2],
+      closing: groups[3],
+    };
+  }
+
+  function paragraphGroupHtml(paragraphs) {
+    if (!paragraphs || !paragraphs.length) return "";
+    return paragraphs.map(function (paragraph) {
+      return "<p>" + esc(paragraph) + "</p>";
+    }).join("\n");
+  }
+
+  function formatCoverLetterDate(date) {
+    var now = date || new Date();
+    var months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    return months[now.getMonth()] + " " + now.getDate() + ", " + now.getFullYear();
+  }
+
+  function trimUrlLabel(url) {
+    return String(url || "").replace(/^https?:\/\//i, "").replace(/\/+$/g, "");
+  }
+
+  function joinHtmlParts(parts) {
+    return (parts || []).filter(function (part) { return !!part; }).join(" &nbsp;·&nbsp; ");
+  }
+
+  function wrapLine(className, html) {
+    return html ? '<div class="' + className + '">' + html + "</div>" : "";
+  }
+
+  function buildApplicantMetaHtml(personal) {
+    personal = personal || {};
+    var primaryLine = joinHtmlParts([
+      personal.email ? esc(personal.email) : "",
+      personal.phone ? esc(personal.phone) : "",
+    ]);
+    var secondaryLine = joinHtmlParts([
+      personal.linkedin ? '<a href="' + esc(personal.linkedin) + '">' + esc(trimUrlLabel(personal.linkedin)) + "</a>" : "",
+      personal.location ? esc(personal.location) : "",
+    ]);
+
+    return [
+      wrapLine("meta-line", primaryLine),
+      wrapLine("meta-line", secondaryLine),
+    ].filter(Boolean).join("\n");
+  }
+
+  function buildRecipientHtml(jobMeta) {
+    jobMeta = jobMeta || {};
+
+    var hiringManagerName = String(jobMeta.hiringManagerName || jobMeta.hiring_manager_name || "Hiring Manager").trim() || "Hiring Manager";
+    var hiringManagerTitle = String(jobMeta.hiringManagerTitle || jobMeta.hiring_manager_title || "").trim();
+    var companyName = String(jobMeta.company || "").trim();
+    var companyLocation = String(jobMeta.location || "").trim();
+
+    var detailLines = [
+      hiringManagerTitle ? '<div class="recipient-detail-line">' + esc(hiringManagerTitle) + "</div>" : "",
+      companyName ? '<div class="recipient-detail-line">' + esc(companyName) + "</div>" : "",
+      companyLocation ? '<div class="recipient-detail-line">' + esc(companyLocation) + "</div>" : "",
+    ].filter(Boolean).join("\n");
+
+    return [
+      '<div class="recipient-name">' + esc(hiringManagerName) + "</div>",
+      detailLines ? '<div class="recipient-detail">' + detailLines + "</div>" : "",
+    ].filter(Boolean).join("\n");
+  }
+
+  JA.buildCoverLetterHtml = async function (coverLetterText, jobMeta, personal) {
     personal = personal || {};
     jobMeta = jobMeta || {};
 
-    var name = esc(personal.name || "");
-    var contactParts = [];
-    if (personal.email) contactParts.push(esc(personal.email));
-    if (personal.phone) contactParts.push(esc(personal.phone));
-    if (personal.location) contactParts.push(esc(personal.location));
-    var contactLine = contactParts.join(" &nbsp;&middot;&nbsp; ");
+    var template = await loadCoverLetterTemplate();
+    var name = String(personal.name || "").trim();
+    var paragraphGroups = paragraphGroupsForTemplate(coverLetterText);
+    var salutation = String(jobMeta.hiringManagerName || jobMeta.hiring_manager_name || "Hiring Manager").trim() || "Hiring Manager";
 
-    var now = new Date();
-    var months = ["January","February","March","April","May","June","July","August","September","October","November","December"];
-    var dateStr = months[now.getMonth()] + " " + now.getDate() + ", " + now.getFullYear();
-
-    var paragraphs = (coverLetterText || "").split(/\n\s*\n/).filter(function (p) { return p.trim(); });
-    var bodyHtml = "";
-    for (var i = 0; i < paragraphs.length; i++) {
-      bodyHtml += "<p>" + esc(paragraphs[i].trim()) + "</p>\n";
-    }
-
-    return "<!DOCTYPE html>\n" +
-      '<html lang="en">\n<head>\n<meta charset="UTF-8">\n' +
-      "<style>" + COVER_LETTER_CSS + "</style>\n" +
-      "</head>\n<body>\n" +
-      '<div class="cl-header">\n' +
-      '<div class="cl-name">' + name + "</div>\n" +
-      '<div class="cl-contact">' + contactLine + "</div>\n" +
-      "</div>\n" +
-      '<div class="cl-date">' + esc(dateStr) + "</div>\n" +
-      '<div class="cl-body">\n' + bodyHtml + "</div>\n" +
-      "</body>\n</html>";
+    return replaceTemplateTokens(template, {
+      APPLICANT_NAME: esc(name),
+      APPLICANT_NAME_PRINT: esc(name),
+      APPLICANT_META_HTML: buildApplicantMetaHtml(personal),
+      DATE: esc(formatCoverLetterDate(new Date())),
+      RECIPIENT_HTML: buildRecipientHtml(jobMeta),
+      SALUTATION_LINE: esc("Dear " + salutation + ","),
+      OPENING_PARAGRAPH_HTML: paragraphGroupHtml(paragraphGroups.opening),
+      BODY_PARAGRAPH_1_HTML: paragraphGroupHtml(paragraphGroups.body1),
+      BODY_PARAGRAPH_2_HTML: paragraphGroupHtml(paragraphGroups.body2),
+      CLOSING_PARAGRAPH_HTML: paragraphGroupHtml(paragraphGroups.closing),
+    });
   };
+
+  loadCoverLetterTemplate().catch(function () {});
 })();
