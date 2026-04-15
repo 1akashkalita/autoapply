@@ -44,7 +44,6 @@ window.JobAutofill = window.JobAutofill || {};
     for (var i = 0; i < fileInputs.length; i++) {
       var el = fileInputs[i];
       var rect = el.getBoundingClientRect();
-      if (rect.width === 0 && rect.height === 0) continue;
 
       var context = [
         el.name || "", el.id || "",
@@ -63,7 +62,7 @@ window.JobAutofill = window.JobAutofill || {};
       }
       context += " " + label + " " + JA.nearbyTextForElement(el);
 
-      if (RESUME_FILE_PATTERN.test(context)) {
+      if ((rect.width > 0 || rect.height > 0 || RESUME_FILE_PATTERN.test(context)) && RESUME_FILE_PATTERN.test(context)) {
         found.push(el);
       }
     }

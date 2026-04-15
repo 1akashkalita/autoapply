@@ -46,5 +46,25 @@ window.JobAutofill = window.JobAutofill || {};
     return fields;
   };
 
+  adapter.resolveFileUploadTarget = function (docType) {
+    var selectors = docType === "coverLetter"
+      ? [
+          '.application-field input[type="file"][name*="cover" i]',
+          '.application-field input[type="file"][name*="letter" i]',
+          'input[type="file"][id*="cover" i]',
+        ]
+      : [
+          '.application-field input[type="file"][name*="resume" i]',
+          '.application-field input[type="file"][name*="cv" i]',
+          'input[type="file"][id*="resume" i]',
+        ];
+
+    for (var i = 0; i < selectors.length; i++) {
+      var match = document.querySelector(selectors[i]);
+      if (match) return match;
+    }
+    return null;
+  };
+
   window.JobAutofill.LeverAdapter = adapter;
 })();

@@ -49,5 +49,25 @@ window.JobAutofill = window.JobAutofill || {};
     // Future: expand collapsed sections, dismiss cookie banners, etc.
   };
 
+  adapter.resolveFileUploadTarget = function (docType) {
+    var selectors = docType === "coverLetter"
+      ? [
+          'input[type="file"][data-automation-id*="cover" i]',
+          'input[type="file"][data-automation-id*="letter" i]',
+          'input[type="file"][aria-label*="cover" i]',
+        ]
+      : [
+          'input[type="file"][data-automation-id*="resume" i]',
+          'input[type="file"][data-automation-id*="file-upload" i]',
+          'input[type="file"][aria-label*="resume" i]',
+        ];
+
+    for (var i = 0; i < selectors.length; i++) {
+      var match = document.querySelector(selectors[i]);
+      if (match) return match;
+    }
+    return null;
+  };
+
   window.JobAutofill.WorkdayAdapter = adapter;
 })();

@@ -281,14 +281,19 @@
       const text = (coverLetterText && coverLetterText.value) ? coverLetterText.value.trim() : "";
       if (!text) { setDocsStatus("Paste cover letter text first.", false); return; }
       if (!currentJobKey) { setDocsStatus("No job detected for this tab yet.", false); return; }
-      const doc = {
-        id: genId(),
-        name: "cover-letter.txt",
-        mime: "text/plain",
-        size: text.length,
-        createdAt: new Date().toISOString(),
-        dataBase64: base64FromUtf8(text),
-      };
+      const JA = window.JobAutofill || {};
+      const settings = await sendBg({ action: "getSettings" });
+      const personal = (settings.ok && settings.resume && settings.resume.personal) ? settings.resume.personal : {};
+      const clHtml = JA.buildCoverLetterHtml
+        ? JA.buildCoverLetterHtml(text, currentJobMeta, personal)
+        : "<pre>" + escHtml(text) + "</pre>";
+      let doc;
+      try {
+        doc = await JA.renderPdfFromHtml(clHtml, buildAiFilename("cover-letter", "pdf"));
+      } catch (err) {
+        setDocsStatus("PDF export failed: " + String(err), false);
+        return;
+      }
       const resp = await sendBg({
         action: "saveJobDocument",
         jobKey: currentJobKey,
@@ -448,7 +453,12 @@
 
       lastAiResult = result;
       renderAiResults(result);
-      await saveAndDownloadAiDocs(result);
+      try {
+        await saveAndDownloadAiDocs(result);
+      } catch (pdfErr) {
+        aiStatus.textContent = "Optimization completed, but PDF export failed: " + String(pdfErr);
+        aiStatus.className = "ai-status ai-status-error";
+      }
       setStatus("🟢 Optimized", "success");
       btnConfirmOptimize.disabled = false;
     });
@@ -548,21 +558,20 @@
           : null;
         var now = new Date().toISOString();
         if (clHtml) {
-          await sendBg({
-            action: "saveJobDocument",
-            jobKey: currentJobKey,
-            jobMeta: currentJobMeta,
-            docType: "coverLetter",
-            doc: {
-              id: genId(),
-              name: buildAiFilename("cover-letter", "html"),
-              mime: "text/html",
-              size: clHtml.length,
-              createdAt: now,
-              dataBase64: base64FromUtf8(clHtml),
-            },
-          });
-          await refreshDocsList();
+          try {
+            var pdfDoc = await JA.renderPdfFromHtml(clHtml, buildAiFilename("cover-letter", "pdf"));
+            pdfDoc.createdAt = now;
+            await sendBg({
+              action: "saveJobDocument",
+              jobKey: currentJobKey,
+              jobMeta: currentJobMeta,
+              docType: "coverLetter",
+              doc: pdfDoc,
+            });
+            await refreshDocsList();
+          } catch (pdfErr) {
+            showCoverLetterError("Cover letter generated, but PDF archive save failed: " + String(pdfErr));
+          }
         }
       }
     });
@@ -578,7 +587,12 @@
       var clHtml = JA.buildCoverLetterHtml
         ? JA.buildCoverLetterHtml(text, currentJobMeta, personal)
         : "<pre>" + escHtml(text) + "</pre>";
-      downloadHtmlAsFile(clHtml, buildAiFilename("cover-letter", "html"));
+      try {
+        var doc = await JA.renderPdfFromHtml(clHtml, buildAiFilename("cover-letter", "pdf"));
+        JA.downloadBase64File(doc.dataBase64, doc.name, doc.mime);
+      } catch (pdfErr) {
+        showCoverLetterError("PDF export failed: " + String(pdfErr));
+      }
     });
   }
 
@@ -837,6 +851,23 @@
       '<span class="stat">⏭️ ' + willSkip.length + ' skipped</span>';
 
     var html = "";
+    if (result.formLayout && result.formLayout.multiStepLikely) {
+      var cues = (result.formLayout.wizardCues || []).join(", ");
+      html +=
+        '<div class="info-banner">Multi-step form likely' +
+        (cues ? " (" + escHtml(cues) + ")" : "") +
+        ". Fill visible fields on this step, then use the app’s Next/Continue.</div>";
+    }
+    if (result.repeatSectionHints && result.repeatSectionHints.length) {
+      var kinds = [];
+      result.repeatSectionHints.forEach(function (h) {
+        if (h && h.kind && kinds.indexOf(h.kind) === -1) kinds.push(h.kind);
+      });
+      html +=
+        '<div class="info-banner">Add/expand controls detected (' +
+        escHtml(kinds.join(", ") || "sections") +
+        "). Click Add to reveal fields if needed, then Preview again.</div>";
+    }
     if (result.navButton && result.navButton.type === "submit") {
       html += '<div class="warning-banner">⚠️ Submit button detected: "' +
         escHtml(result.navButton.text) + '". This extension will NOT auto-submit.</div>';
@@ -878,10 +909,11 @@
     var personal = (settings.ok && settings.resume && settings.resume.personal) ? settings.resume.personal : {};
     var now      = new Date().toISOString();
 
-    if (result.tailoredResume && JA.buildResumeHtml) {
+    if (result.tailoredResume && JA.buildResumeHtml && JA.renderPdfFromHtml) {
       var resumeHtml = JA.buildResumeHtml(result.tailoredResume);
-      var resumeB64  = base64FromUtf8(resumeHtml);
-      downloadHtmlAsFile(resumeHtml, buildAiFilename("tailored-resume", "html"));
+      var resumeDoc  = await JA.renderPdfFromHtml(resumeHtml, buildAiFilename("tailored-resume", "pdf"));
+      resumeDoc.createdAt = now;
+      JA.downloadBase64File(resumeDoc.dataBase64, resumeDoc.name, resumeDoc.mime);
 
       if (currentJobKey) {
         await sendBg({
@@ -889,22 +921,16 @@
           jobKey: currentJobKey,
           jobMeta: currentJobMeta,
           docType: "editedResume",
-          doc: {
-            id: genId(),
-            name: buildAiFilename("tailored-resume", "html"),
-            mime: "text/html",
-            size: resumeHtml.length,
-            createdAt: now,
-            dataBase64: resumeB64,
-          },
+          doc: resumeDoc,
         });
       }
     }
 
-    if (result.coverLetterText && JA.buildCoverLetterHtml) {
+    if (result.coverLetterText && JA.buildCoverLetterHtml && JA.renderPdfFromHtml) {
       var clHtml = JA.buildCoverLetterHtml(result.coverLetterText, currentJobMeta, personal);
-      var clB64  = base64FromUtf8(clHtml);
-      downloadHtmlAsFile(clHtml, buildAiFilename("cover-letter", "html"));
+      var clDoc  = await JA.renderPdfFromHtml(clHtml, buildAiFilename("cover-letter", "pdf"));
+      clDoc.createdAt = now;
+      JA.downloadBase64File(clDoc.dataBase64, clDoc.name, clDoc.mime);
 
       if (currentJobKey) {
         await sendBg({
@@ -912,14 +938,7 @@
           jobKey: currentJobKey,
           jobMeta: currentJobMeta,
           docType: "coverLetter",
-          doc: {
-            id: genId(),
-            name: buildAiFilename("cover-letter", "html"),
-            mime: "text/html",
-            size: clHtml.length,
-            createdAt: now,
-            dataBase64: clB64,
-          },
+          doc: clDoc,
         });
       }
     }

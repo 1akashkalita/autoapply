@@ -229,6 +229,18 @@ window.JobAutofill = window.JobAutofill || {};
     if (!msg || !msg.action) return false;
 
     switch (msg.action) {
+      case "toggleSidebar":
+        if (JA.toggleSidebar) JA.toggleSidebar();
+        return false;
+
+      case "openSidebar":
+        if (JA.openSidebar) JA.openSidebar();
+        return false;
+
+      case "hideSidebar":
+        if (JA.hideSidebar) JA.hideSidebar();
+        return false;
+
       case "scanFields":
         handleScan(sendResponse);
         return true; // async response
@@ -274,7 +286,7 @@ window.JobAutofill = window.JobAutofill || {};
         return false;
 
       default:
-        sendResponse({ error: "unknown action: " + msg.action });
+        // Sidebar and other scripts may handle the same message; do not respond.
         return false;
     }
   });
@@ -298,6 +310,8 @@ window.JobAutofill = window.JobAutofill || {};
 
       // Detect navigation buttons
       var navButton = JA.detectNavigationButton();
+      var formLayout = JA.detectFormLayout ? JA.detectFormLayout(navButton) : null;
+      var repeatSectionHints = JA.detectRepeatSectionHints ? JA.detectRepeatSectionHints() : [];
       var jobMeta = extractJobMeta();
       var jobKey = buildJobKey(jobMeta);
 
@@ -307,6 +321,8 @@ window.JobAutofill = window.JobAutofill || {};
         ok: true,
         fields: fields,
         navButton: navButton,
+        formLayout: formLayout,
+        repeatSectionHints: repeatSectionHints,
         url: window.location.href,
         adapterName: adapter ? adapter.name : "generic",
         jobMeta: jobMeta,
@@ -386,6 +402,9 @@ window.JobAutofill = window.JobAutofill || {};
       sendResponse({ ok: false, error: String(err) });
     }
   }
+
+  JA.extractJobMeta = extractJobMeta;
+  JA.buildJobKey = buildJobKey;
 
   JA.log("INFO", "Job Autofill content script loaded on " + window.location.href);
 

@@ -3,9 +3,10 @@
   "name": "Job Autofill",
   "version": "1.0.0",
   "description": "Automatically fill job application forms using your saved profile data.",
-  "permissions": ["activeTab", "storage", "downloads"],
+  "permissions": ["activeTab", "storage", "downloads", "debugger"],
   "host_permissions": ["https://api.openai.com/*"],
   "action": {
+    "default_popup": "popup/toolbar_popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
@@ -36,10 +37,15 @@
         "content/site_adapters/lever.js",
         "content/site_adapters/workday.js",
         "content/site_adapters/adapter_registry.js",
+        "shared/file_upload.js",
         "content/dom_filler.js",
         "content/notification_widget.js",
         "content/opportunity_detector.js",
-        "content/content_main.js"
+        "content/repeat_section_hints.js",
+        "content/content_main.js",
+        "shared/resume_html_builder.js",
+        "shared/pdf_export.js",
+        "content/sidebar.js"
       ],
       "run_at": "document_idle"
     }

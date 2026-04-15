@@ -76,14 +76,9 @@ window.JobAutofill = window.JobAutofill || {};
           log("CHECK", label + " <- " + value);
         } else if (type === "file") {
           var fileData = m.__fileData;
-          if (fileData && fileData.dataBase64 && JA.base64ToBytes) {
+          if (fileData && fileData.dataBase64 && JA.attachFileToElement) {
             try {
-              var bytes = JA.base64ToBytes(fileData.dataBase64);
-              var synthFile = new File([bytes], fileData.name || "resume.pdf", { type: fileData.mime || "application/pdf" });
-              var dt = new DataTransfer();
-              dt.items.add(synthFile);
-              element.files = dt.files;
-              element.dispatchEvent(new Event("change", { bubbles: true }));
+              JA.attachFileToElement(element, fileData);
               filled.push({ field: label, value: fileData.name || "resume.pdf" });
               log("FILE", label + " <- " + (fileData.name || "resume.pdf"));
             } catch (fileErr) {

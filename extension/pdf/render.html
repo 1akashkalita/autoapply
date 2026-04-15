@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Render</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #fff;
+    }
+  </style>
+</head>
+<body>
+  <script>
+    (async function () {
+      try {
+        var params = new URLSearchParams(window.location.search);
+        var renderId = params.get("renderId");
+        if (!renderId) return;
+        var key = "jaf_pdf_render_" + renderId;
+        var result = await chrome.storage.session.get(key);
+        var payload = result && result[key];
+        if (!payload || !payload.html) return;
+        document.open();
+        document.write(String(payload.html));
+        document.close();
+      } catch (e) {
+        document.body.textContent = "PDF render failed: " + String(e);
+      }
+    })();
+  </script>
+</body>
+</html>

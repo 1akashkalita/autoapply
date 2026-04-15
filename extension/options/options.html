@@ -3,214 +3,297 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Job Autofill - Settings</title>
+  <title>Job Autofill Dashboard</title>
   <link rel="stylesheet" href="options.css">
 </head>
 <body>
   <div class="container">
-    <header class="header">
-      <h1>✦ Job Autofill Settings</h1>
-      <p class="subtitle">Configure your profile and extension preferences.</p>
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Extension Dashboard</p>
+        <h1>Job Autofill Control Center</h1>
+        <p class="subtitle">Track API spend, browse archived PDFs, and edit your profile from one page.</p>
+      </div>
+      <div class="hero-note">
+        <span class="pill">Local only</span>
+        <span class="pill">PDF archive</span>
+        <span class="pill">Usage by operation</span>
+      </div>
     </header>
 
-    <!-- Import / Export -->
-    <section class="card">
-      <h2>📥 Import Profile</h2>
-      <p class="help-text">
-        Import your existing <code>applicant_data.json</code> file from the resume_tool.
-      </p>
-      <div class="import-row">
-        <textarea id="jsonImport" rows="3" placeholder='Paste your applicant_data.json contents here...'></textarea>
-        <button id="btnImport" class="btn btn-secondary">Import JSON</button>
+    <section class="dashboard-shell">
+      <div class="kpi-grid">
+        <article class="kpi-card">
+          <span class="kpi-label">Total requests</span>
+          <strong id="kpiTotalRequests" class="kpi-value">0</strong>
+          <span class="kpi-sub">Tracked OpenAI calls from this extension</span>
+        </article>
+        <article class="kpi-card">
+          <span class="kpi-label">Prompt tokens</span>
+          <strong id="kpiPromptTokens" class="kpi-value">0</strong>
+          <span class="kpi-sub">Input volume sent to the API</span>
+        </article>
+        <article class="kpi-card">
+          <span class="kpi-label">Completion tokens</span>
+          <strong id="kpiCompletionTokens" class="kpi-value">0</strong>
+          <span class="kpi-sub">Generated output volume</span>
+        </article>
+        <article class="kpi-card accent">
+          <span class="kpi-label">Approx cost</span>
+          <strong id="kpiApproxCost" class="kpi-value">$0.00</strong>
+          <span class="kpi-sub">Estimated using built-in model pricing</span>
+        </article>
       </div>
-      <div id="importStatus" class="status-msg hidden"></div>
+
+      <div class="dashboard-grid">
+        <section class="card chart-card">
+          <div class="card-head">
+            <div>
+              <h2>API Usage Timeline</h2>
+              <p class="help-text">Recent daily token usage grouped by operation.</p>
+            </div>
+            <button type="button" id="btnResetApiUsage" class="btn btn-secondary">Reset usage</button>
+          </div>
+          <canvas id="usageTimelineChart" height="240"></canvas>
+          <div id="usageTimelineEmpty" class="empty-state hidden">No recorded API activity yet.</div>
+          <div id="timelineLegend" class="legend-row"></div>
+          <div id="apiUsageStatus" class="status-msg hidden"></div>
+        </section>
+
+        <section class="card chart-card">
+          <div class="card-head">
+            <div>
+              <h2>Where Usage Goes</h2>
+              <p class="help-text">Operation-level breakdown for requests, tokens, and estimated spend.</p>
+            </div>
+          </div>
+          <canvas id="usageBreakdownChart" height="240"></canvas>
+          <div id="usageBreakdownEmpty" class="empty-state hidden">Run optimize, cover letter, or autofill with LLM enabled to populate this chart.</div>
+          <div id="usageBreakdownList" class="breakdown-list"></div>
+        </section>
+      </div>
+
+      <section class="card archive-card">
+        <div class="card-head">
+          <div>
+            <h2>Document Archive</h2>
+            <p class="help-text">Every stored tailored resume and cover letter PDF, searchable across jobs.</p>
+          </div>
+          <button type="button" id="btnRefreshArchive" class="btn btn-secondary">Refresh</button>
+        </div>
+        <div class="archive-toolbar">
+          <input type="search" id="archiveSearch" placeholder="Search by company, title, filename, or job key">
+          <select id="archiveDocType">
+            <option value="">All document types</option>
+            <option value="editedResume">Resumes</option>
+            <option value="coverLetter">Cover letters</option>
+          </select>
+        </div>
+        <div id="archiveStatus" class="status-msg hidden"></div>
+        <div class="archive-table-wrap">
+          <table class="archive-table">
+            <thead>
+              <tr>
+                <th>Document</th>
+                <th>Job</th>
+                <th>Type</th>
+                <th>Created</th>
+                <th>Size</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="archiveTableBody">
+              <tr><td colspan="6" class="empty-row">Loading archive…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
     </section>
 
-    <!-- Profile Form -->
-    <section class="card">
-      <h2>👤 Applicant Profile</h2>
-      <p class="help-text">This data is used to auto-fill job application forms.</p>
+    <section class="editor-grid">
+      <div class="editor-column">
+        <section class="card">
+          <h2>Import Profile</h2>
+          <p class="help-text">Import your existing <code>applicant_data.json</code> file from the resume tool.</p>
+          <div class="import-row">
+            <textarea id="jsonImport" rows="4" placeholder='Paste your applicant_data.json contents here...'></textarea>
+            <button id="btnImport" class="btn btn-secondary">Import JSON</button>
+          </div>
+          <div id="importStatus" class="status-msg hidden"></div>
+        </section>
 
-      <form id="profileForm">
-        <div class="form-row">
-          <div class="form-group">
-            <label for="first_name">First Name</label>
-            <input type="text" id="first_name" name="first_name">
-          </div>
-          <div class="form-group">
-            <label for="last_name">Last Name</label>
-            <input type="text" id="last_name" name="last_name">
-          </div>
-        </div>
+        <section class="card">
+          <h2>Applicant Profile</h2>
+          <p class="help-text">This data is used to auto-fill job application forms.</p>
+          <form id="profileForm">
+            <div class="form-row">
+              <div class="form-group">
+                <label for="first_name">First Name</label>
+                <input type="text" id="first_name" name="first_name">
+              </div>
+              <div class="form-group">
+                <label for="last_name">Last Name</label>
+                <input type="text" id="last_name" name="last_name">
+              </div>
+            </div>
 
-        <div class="form-row">
-          <div class="form-group">
-            <label for="email">Email</label>
-            <input type="email" id="email" name="email">
-          </div>
-          <div class="form-group">
-            <label for="phone">Phone</label>
-            <input type="tel" id="phone" name="phone">
-          </div>
-        </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="email">Email</label>
+                <input type="email" id="email" name="email">
+              </div>
+              <div class="form-group">
+                <label for="phone">Phone</label>
+                <input type="tel" id="phone" name="phone">
+              </div>
+            </div>
 
-        <h3 class="section-heading">🏠 Address</h3>
-        <div class="form-group">
-          <label for="street">Street Address</label>
-          <input type="text" id="street" name="street">
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label for="city">City</label>
-            <input type="text" id="city" name="city">
-          </div>
-          <div class="form-group">
-            <label for="state">State</label>
-            <input type="text" id="state" name="state">
-          </div>
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label for="zip">ZIP Code</label>
-            <input type="text" id="zip" name="zip">
-          </div>
-          <div class="form-group">
-            <label for="country">Country</label>
-            <input type="text" id="country" name="country" value="United States">
-          </div>
-        </div>
+            <h3 class="section-heading">Address</h3>
+            <div class="form-group">
+              <label for="street">Street Address</label>
+              <input type="text" id="street" name="street">
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="city">City</label>
+                <input type="text" id="city" name="city">
+              </div>
+              <div class="form-group">
+                <label for="state">State</label>
+                <input type="text" id="state" name="state">
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="zip">ZIP Code</label>
+                <input type="text" id="zip" name="zip">
+              </div>
+              <div class="form-group">
+                <label for="country">Country</label>
+                <input type="text" id="country" name="country" value="United States">
+              </div>
+            </div>
 
-        <h3 class="section-heading">🔗 Links</h3>
-        <div class="form-group">
-          <label for="linkedin">LinkedIn URL</label>
-          <input type="url" id="linkedin" name="linkedin" placeholder="https://linkedin.com/in/...">
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label for="github">GitHub URL</label>
-            <input type="url" id="github" name="github" placeholder="https://github.com/...">
-          </div>
-          <div class="form-group">
-            <label for="portfolio">Portfolio URL</label>
-            <input type="url" id="portfolio" name="portfolio" placeholder="https://...">
-          </div>
-        </div>
+            <h3 class="section-heading">Links</h3>
+            <div class="form-group">
+              <label for="linkedin">LinkedIn URL</label>
+              <input type="url" id="linkedin" name="linkedin" placeholder="https://linkedin.com/in/...">
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="github">GitHub URL</label>
+                <input type="url" id="github" name="github" placeholder="https://github.com/...">
+              </div>
+              <div class="form-group">
+                <label for="portfolio">Portfolio URL</label>
+                <input type="url" id="portfolio" name="portfolio" placeholder="https://...">
+              </div>
+            </div>
 
-        <h3 class="section-heading">🎓 Education</h3>
-        <div class="form-group">
-          <label for="university">University / School</label>
-          <input type="text" id="university" name="university">
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label for="degree">Degree</label>
-            <input type="text" id="degree" name="degree" placeholder="B.S. Computer Science">
-          </div>
-          <div class="form-group">
-            <label for="gpa">GPA</label>
-            <input type="text" id="gpa" name="gpa" placeholder="3.8">
-          </div>
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label for="graduation_month">Graduation Month</label>
-            <input type="text" id="graduation_month" name="graduation_month" placeholder="May">
-          </div>
-          <div class="form-group">
-            <label for="graduation_year">Graduation Year</label>
-            <input type="text" id="graduation_year" name="graduation_year" placeholder="2028">
-          </div>
-        </div>
+            <h3 class="section-heading">Education</h3>
+            <div class="form-group">
+              <label for="university">University / School</label>
+              <input type="text" id="university" name="university">
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="degree">Degree</label>
+                <input type="text" id="degree" name="degree" placeholder="B.S. Computer Science">
+              </div>
+              <div class="form-group">
+                <label for="gpa">GPA</label>
+                <input type="text" id="gpa" name="gpa" placeholder="3.8">
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="graduation_month">Graduation Month</label>
+                <input type="text" id="graduation_month" name="graduation_month" placeholder="May">
+              </div>
+              <div class="form-group">
+                <label for="graduation_year">Graduation Year</label>
+                <input type="text" id="graduation_year" name="graduation_year" placeholder="2028">
+              </div>
+            </div>
 
-        <h3 class="section-heading">📋 Work Authorization</h3>
-        <div class="form-group">
-          <label for="work_authorization">Authorization Status</label>
-          <input type="text" id="work_authorization" name="work_authorization"
-            placeholder="US Citizen / Authorized to work">
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label for="require_sponsorship">Require Sponsorship?</label>
-            <select id="require_sponsorship" name="require_sponsorship">
-              <option value="false">No</option>
-              <option value="true">Yes</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label for="years_of_experience">Years of Experience</label>
-            <input type="text" id="years_of_experience" name="years_of_experience"
-              placeholder="0-1">
-          </div>
-        </div>
+            <h3 class="section-heading">Work Authorization</h3>
+            <div class="form-group">
+              <label for="work_authorization">Authorization Status</label>
+              <input type="text" id="work_authorization" name="work_authorization" placeholder="US Citizen / Authorized to work">
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="require_sponsorship">Require Sponsorship?</label>
+                <select id="require_sponsorship" name="require_sponsorship">
+                  <option value="false">No</option>
+                  <option value="true">Yes</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="years_of_experience">Years of Experience</label>
+                <input type="text" id="years_of_experience" name="years_of_experience" placeholder="0-1">
+              </div>
+            </div>
 
-        <div class="form-actions">
-          <button type="submit" class="btn btn-primary">Save Profile</button>
-          <button type="button" id="btnExport" class="btn btn-secondary">Export JSON</button>
-        </div>
-      </form>
-      <div id="profileStatus" class="status-msg hidden"></div>
-    </section>
-
-    <!-- AI Settings -->
-    <section class="card">
-      <h2>🤖 AI Settings</h2>
-      <p class="help-text">
-        Enable LLM-powered field mapping for fields the rule-based matcher can't handle.
-        Requires an OpenAI API key. The extension works fine without this.
-      </p>
-      <div class="form-group">
-        <label for="apiKey">OpenAI API Key</label>
-        <input type="password" id="apiKey" placeholder="sk-...">
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">Save Profile</button>
+              <button type="button" id="btnExport" class="btn btn-secondary">Export JSON</button>
+            </div>
+          </form>
+          <div id="profileStatus" class="status-msg hidden"></div>
+        </section>
       </div>
-      <div class="form-group">
-        <label class="checkbox-label">
-          <input type="checkbox" id="llmEnabled">
-          Enable LLM fallback for unmatched fields
-        </label>
-      </div>
-      <div class="form-group" style="margin-top: 14px;">
-        <label for="styleProfile">Cover Letter Style Profile</label>
-        <p class="help-text">
-          Controls how the AI writes your cover letters. Customize tone, length, and style.
-        </p>
-        <textarea id="styleProfile" rows="6" placeholder="Tone: direct, technical..."></textarea>
-      </div>
-      <button id="btnSaveAi" class="btn btn-secondary">Save AI Settings</button>
-      <div id="aiSettingsStatus" class="status-msg hidden"></div>
-    </section>
 
-    <!-- Resume JSON -->
-    <section class="card">
-      <h2>📄 Resume Data</h2>
-      <p class="help-text">
-        Paste your <code>master_resume.json</code> or <code>tailored_resume.json</code>
-        for richer LLM-based field matching. Not required for basic autofill.
-      </p>
-      <textarea id="resumeJson" rows="4" placeholder='Paste resume JSON here...'></textarea>
-      <button id="btnSaveResume" class="btn btn-secondary">Save Resume Data</button>
-      <div id="resumeStatus" class="status-msg hidden"></div>
-    </section>
+      <div class="editor-column">
+        <section class="card">
+          <h2>AI Settings</h2>
+          <p class="help-text">Enable LLM-powered field mapping and document generation. The extension still works without this.</p>
+          <div class="form-group">
+            <label for="apiKey">OpenAI API Key</label>
+            <input type="password" id="apiKey" placeholder="sk-...">
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="llmEnabled">
+              Enable LLM fallback for unmatched fields
+            </label>
+          </div>
+          <div class="form-group">
+            <label for="styleProfile">Cover Letter Style Profile</label>
+            <p class="help-text">Controls how the AI writes your cover letters.</p>
+            <textarea id="styleProfile" rows="8" placeholder="Tone: direct, technical..."></textarea>
+          </div>
+          <button id="btnSaveAi" class="btn btn-secondary">Save AI Settings</button>
+          <div id="aiSettingsStatus" class="status-msg hidden"></div>
+        </section>
 
-    <!-- Base Resume PDF -->
-    <section class="card">
-      <h2>📎 Base Resume PDF</h2>
-      <p class="help-text">
-        Upload the resume PDF you want to use as your base. The extension stores it locally
-        and can auto-attach it to file upload fields on job applications.
-      </p>
-      <div class="form-group">
-        <label for="baseResumePdf">Upload PDF</label>
-        <input type="file" id="baseResumePdf" accept="application/pdf">
+        <section class="card">
+          <h2>Resume Data</h2>
+          <p class="help-text">Paste your <code>master_resume.json</code> or <code>tailored_resume.json</code> for richer AI features.</p>
+          <textarea id="resumeJson" rows="10" placeholder='Paste resume JSON here...'></textarea>
+          <button id="btnSaveResume" class="btn btn-secondary">Save Resume Data</button>
+          <div id="resumeStatus" class="status-msg hidden"></div>
+        </section>
+
+        <section class="card">
+          <h2>Base Resume PDF</h2>
+          <p class="help-text">Upload the PDF used for resume attachment on job application forms.</p>
+          <div class="form-group">
+            <label for="baseResumePdf">Upload PDF</label>
+            <input type="file" id="baseResumePdf" accept="application/pdf">
+          </div>
+          <div id="baseResumePdfMeta" class="help-text"></div>
+          <div class="form-actions">
+            <button type="button" id="btnDownloadBaseResumePdf" class="btn btn-secondary">Download stored PDF</button>
+            <button type="button" id="btnClearBaseResumePdf" class="btn btn-secondary">Clear stored PDF</button>
+          </div>
+          <div id="baseResumePdfStatus" class="status-msg hidden"></div>
+        </section>
       </div>
-      <div id="baseResumePdfMeta" class="help-text"></div>
-      <div class="form-actions">
-        <button type="button" id="btnDownloadBaseResumePdf" class="btn btn-secondary">Download stored PDF</button>
-        <button type="button" id="btnClearBaseResumePdf" class="btn btn-secondary">Clear stored PDF</button>
-      </div>
-      <div id="baseResumePdfStatus" class="status-msg hidden"></div>
     </section>
   </div>
 
+  <script src="../shared/pdf_export.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

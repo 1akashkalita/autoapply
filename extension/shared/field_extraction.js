@@ -80,7 +80,7 @@ window.JobAutofill.extractFields = function () {
   for (const el of elements) {
     if (el.type === "hidden") continue;
     const rect = el.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) continue;
+    if (el.type !== "file" && rect.width === 0 && rect.height === 0) continue;
 
     const info = {
       tag: el.tagName.toLowerCase(),

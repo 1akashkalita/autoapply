@@ -201,7 +201,6 @@ window.JobAutofill = window.JobAutofill || {};
       '<html lang="en">\n<head>\n<meta charset="UTF-8">\n' +
       "<style>" + RESUME_CSS + "</style>\n" +
       "</head>\n<body>\n" + body + "\n" +
-      "<script>window.onload=function(){window.print();}<\/script>\n" +
       "</body>\n</html>";
   };
 
@@ -248,7 +247,6 @@ window.JobAutofill = window.JobAutofill || {};
       "</div>\n" +
       '<div class="cl-date">' + esc(dateStr) + "</div>\n" +
       '<div class="cl-body">\n' + bodyHtml + "</div>\n" +
-      "<script>window.onload=function(){window.print();}<\/script>\n" +
       "</body>\n</html>";
   };
 })();

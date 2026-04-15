@@ -282,7 +282,8 @@ window.JobAutofill = window.JobAutofill || {};
         '<span class="jaf-w-label">' + (opportunities.fieldCount || "Form") + ' fields found</span>' +
         '<button class="jaf-w-btn jaf-w-btn-fill">Autofill</button>';
       row1.querySelector(".jaf-w-btn").addEventListener("click", function () {
-        safeSendMessage({ action: "startAutofill", mode: "fill" });
+        if (JA.openSidebar) { JA.openSidebar(); }
+        else { safeSendMessage({ action: "startAutofill", mode: "fill" }); }
         collapseToTab();
       });
       body.appendChild(row1);
@@ -296,7 +297,8 @@ window.JobAutofill = window.JobAutofill || {};
         '<span class="jaf-w-label">Optimize your resume</span>' +
         '<button class="jaf-w-btn jaf-w-btn-optimize">Optimize</button>';
       row2.querySelector(".jaf-w-btn").addEventListener("click", function () {
-        safeSendMessage({ action: "requestOptimize" });
+        if (JA.openSidebar) { JA.openSidebar(); }
+        else { safeSendMessage({ action: "requestOptimize" }); }
         collapseToTab();
       });
       body.appendChild(row2);
@@ -342,51 +344,9 @@ window.JobAutofill = window.JobAutofill || {};
         JA.log("WARN", "No base resume PDF configured for auto-attach.");
         return;
       }
-      var fileInputs = document.querySelectorAll('input[type="file"]');
-      var resumePattern = /resume|cv|curriculum/i;
-      var target = null;
-
-      for (var i = 0; i < fileInputs.length; i++) {
-        var el = fileInputs[i];
-        var context = [
-          el.name || "", el.id || "",
-          el.getAttribute("aria-label") || "",
-          el.getAttribute("accept") || "",
-        ].join(" ");
-        var label = "";
-        if (el.id) {
-          var lbl = document.querySelector('label[for="' + el.id + '"]');
-          if (lbl) label = lbl.innerText || "";
-        }
-        if (!label) {
-          var parent = el.closest("label");
-          if (parent) label = parent.innerText || "";
-        }
-        context += " " + label;
-        if (JA.nearbyTextForElement) context += " " + JA.nearbyTextForElement(el);
-
-        if (resumePattern.test(context)) {
-          target = el;
-          break;
-        }
-      }
-
-      if (!target) {
-        if (fileInputs.length === 1) target = fileInputs[0];
-      }
-
-      if (!target) {
-        JA.log("WARN", "No resume file input found on page for auto-attach.");
-        return;
-      }
-
       try {
-        var bytes = JA.base64ToBytes(resp.pdf.dataBase64);
-        var file = new File([bytes], resp.pdf.name || "resume.pdf", { type: resp.pdf.mime || "application/pdf" });
-        var dt = new DataTransfer();
-        dt.items.add(file);
-        target.files = dt.files;
-        target.dispatchEvent(new Event("change", { bubbles: true }));
+        if (!JA.attachFileToPage) throw new Error("Upload helper unavailable");
+        JA.attachFileToPage(resp.pdf, "resume");
         JA.log("INFO", "Resume auto-attached to file input.");
       } catch (e) {
         JA.log("ERROR", "Failed to auto-attach resume: " + e);

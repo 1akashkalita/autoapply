@@ -61,4 +61,12 @@ window.JobAutofill.BaseAdapter.prototype = {
   afterFill: function () {
     // no-op by default
   },
+
+  /**
+   * Resolve the native file input backing a visible upload widget.
+   * Return null to fall back to the generic file-upload helper.
+   */
+  resolveFileUploadTarget: function () {
+    return null;
+  },
 };

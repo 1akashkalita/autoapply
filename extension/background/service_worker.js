@@ -4,7 +4,7 @@
  * profile storage management, and optional OpenAI API integration.
  */
 
-importScripts("../shared/match_rules.js");
+importScripts("../shared/match_rules.js", "../shared/archive_db.js");
 
 // ---- Storage helpers -------------------------------------------------------
 
@@ -17,11 +17,264 @@ const STORAGE_KEYS = {
   LLM_ENABLED: "jaf_llm_enabled",
   LAST_FILL_LOG: "jaf_last_fill_log",
   STYLE_PROFILE: "jaf_style_profile",
+  API_USAGE: "jaf_api_usage",
 };
 
-// Storage sizing/retention (chrome.storage.local is quota-limited; keep it bounded)
-const MAX_DOCS_PER_JOB_PER_TYPE = 5;
-const MAX_TOTAL_BYTES_SOFT = 8 * 1024 * 1024; // soft cap; we’ll trim before exceeding
+const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
+const MODEL_PRICING = {
+  "gpt-4o-mini": { inputPer1M: 0.15, outputPer1M: 0.6 },
+};
+const ARCHIVE_META_KEYS = {
+  MIGRATION_V1: "migration_v1",
+};
+
+// ---- API usage (OpenAI responses) ------------------------------------------
+
+function cloneJson(value) {
+  return value ? JSON.parse(JSON.stringify(value)) : value;
+}
+
+function genId(prefix) {
+  if (self.crypto && typeof self.crypto.randomUUID === "function") {
+    return prefix + "_" + self.crypto.randomUUID();
+  }
+  return prefix + "_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
+}
+
+function normalizeModelName(model) {
+  return MODEL_PRICING[model] ? model : DEFAULT_OPENAI_MODEL;
+}
+
+function computeApproxCostUsd(promptTokens, completionTokens, model) {
+  var pricing = MODEL_PRICING[normalizeModelName(model)] || MODEL_PRICING[DEFAULT_OPENAI_MODEL];
+  var inputCost = ((Number(promptTokens) || 0) / 1000000) * pricing.inputPer1M;
+  var outputCost = ((Number(completionTokens) || 0) / 1000000) * pricing.outputPer1M;
+  return Number((inputCost + outputCost).toFixed(6));
+}
+
+function createEmptyUsageSummary() {
+  return {
+    key: ArchiveDB.SUMMARY_KEY,
+    totalPromptTokens: 0,
+    totalCompletionTokens: 0,
+    totalRequests: 0,
+    approxCostUsd: 0,
+    lastRequestAt: null,
+    byOperation: {},
+    legacyBackfill: false,
+  };
+}
+
+function applyUsageEventToSummary(summary, eventRecord) {
+  var next = cloneJson(summary) || createEmptyUsageSummary();
+  var op = eventRecord.operation || "unknown";
+  if (!next.byOperation[op]) {
+    next.byOperation[op] = {
+      count: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      approxCostUsd: 0,
+      lastRequestAt: null,
+      model: eventRecord.model || DEFAULT_OPENAI_MODEL,
+    };
+  }
+
+  next.totalPromptTokens += Number(eventRecord.promptTokens) || 0;
+  next.totalCompletionTokens += Number(eventRecord.completionTokens) || 0;
+  next.totalRequests += 1;
+  next.approxCostUsd = Number((next.approxCostUsd + (Number(eventRecord.approxCostUsd) || 0)).toFixed(6));
+  next.lastRequestAt = eventRecord.timestamp || next.lastRequestAt;
+
+  next.byOperation[op].count += 1;
+  next.byOperation[op].promptTokens += Number(eventRecord.promptTokens) || 0;
+  next.byOperation[op].completionTokens += Number(eventRecord.completionTokens) || 0;
+  next.byOperation[op].approxCostUsd = Number((next.byOperation[op].approxCostUsd + (Number(eventRecord.approxCostUsd) || 0)).toFixed(6));
+  next.byOperation[op].lastRequestAt = eventRecord.timestamp || next.byOperation[op].lastRequestAt;
+  next.byOperation[op].model = eventRecord.model || next.byOperation[op].model || DEFAULT_OPENAI_MODEL;
+  return next;
+}
+
+async function persistUsageSummary(summary) {
+  await ArchiveDB.setUsageSummary(summary);
+  await chrome.storage.local.set({ [STORAGE_KEYS.API_USAGE]: summary });
+}
+
+async function ensureArchiveReady() {
+  await ArchiveDB.openDb();
+  await migrateLegacyArchiveIfNeeded();
+}
+
+async function migrateLegacyArchiveIfNeeded() {
+  var migrationState = await ArchiveDB.getMeta(ARCHIVE_META_KEYS.MIGRATION_V1);
+  if (migrationState && migrationState.completedAt) return;
+
+  var legacy = await chrome.storage.local.get([STORAGE_KEYS.JOB_DOCUMENTS, STORAGE_KEYS.API_USAGE]);
+  var legacyDocs = legacy[STORAGE_KEYS.JOB_DOCUMENTS] || {};
+  var legacyUsage = legacy[STORAGE_KEYS.API_USAGE] || null;
+
+  for (const jobKey of Object.keys(legacyDocs)) {
+    const bucket = legacyDocs[jobKey] || {};
+    const jobMeta = bucket.jobMeta || null;
+    const edited = Array.isArray(bucket.editedResumes) ? bucket.editedResumes : [];
+    const covers = Array.isArray(bucket.coverLetters) ? bucket.coverLetters : [];
+
+    for (const doc of edited) {
+      if (!doc || !doc.id || !doc.dataBase64) continue;
+      await ArchiveDB.saveJobDocument(jobKey, jobMeta, "editedResume", doc);
+    }
+    for (const doc2 of covers) {
+      if (!doc2 || !doc2.id || !doc2.dataBase64) continue;
+      await ArchiveDB.saveJobDocument(jobKey, jobMeta, "coverLetter", doc2);
+    }
+  }
+
+  var summary = await ArchiveDB.getUsageSummary();
+  if (!summary) summary = createEmptyUsageSummary();
+  if (legacyUsage && legacyUsage.totalRequests && summary.totalRequests === 0) {
+    summary.totalPromptTokens = Number(legacyUsage.totalPromptTokens) || 0;
+    summary.totalCompletionTokens = Number(legacyUsage.totalCompletionTokens) || 0;
+    summary.totalRequests = Number(legacyUsage.totalRequests) || 0;
+    summary.lastRequestAt = legacyUsage.lastRequestAt || null;
+    summary.approxCostUsd = computeApproxCostUsd(summary.totalPromptTokens, summary.totalCompletionTokens, DEFAULT_OPENAI_MODEL);
+    summary.byOperation = {};
+
+    const byOperation = legacyUsage.byOperation || {};
+    for (const op of Object.keys(byOperation)) {
+      const entry = byOperation[op] || {};
+      summary.byOperation[op] = {
+        count: Number(entry.count) || 0,
+        promptTokens: Number(entry.promptTokens) || 0,
+        completionTokens: Number(entry.completionTokens) || 0,
+        approxCostUsd: computeApproxCostUsd(entry.promptTokens, entry.completionTokens, DEFAULT_OPENAI_MODEL),
+        lastRequestAt: legacyUsage.lastRequestAt || null,
+        model: DEFAULT_OPENAI_MODEL,
+      };
+    }
+    summary.legacyBackfill = true;
+    await persistUsageSummary(summary);
+  }
+
+  await ArchiveDB.setMeta(ARCHIVE_META_KEYS.MIGRATION_V1, {
+    completedAt: new Date().toISOString(),
+    migratedJobCount: Object.keys(legacyDocs).length,
+    hadLegacyUsage: !!legacyUsage,
+  });
+}
+
+async function recordApiUsage(usage, operation, context) {
+  if (!usage || typeof usage !== "object") return;
+  await ensureArchiveReady();
+
+  const pt = Number(usage.prompt_tokens) || 0;
+  const ct = Number(usage.completion_tokens) || 0;
+  const timestamp = new Date().toISOString();
+  const model = normalizeModelName((context && context.model) || DEFAULT_OPENAI_MODEL);
+  const eventRecord = {
+    id: genId("usage"),
+    timestamp: timestamp,
+    operation: operation || "unknown",
+    model: model,
+    promptTokens: pt,
+    completionTokens: ct,
+    approxCostUsd: computeApproxCostUsd(pt, ct, model),
+    jobKey: context && context.jobKey ? context.jobKey : "",
+  };
+
+  await ArchiveDB.addUsageEvent(eventRecord);
+  const current = (await ArchiveDB.getUsageSummary()) || createEmptyUsageSummary();
+  const next = applyUsageEventToSummary(current, eventRecord);
+  await persistUsageSummary(next);
+}
+
+// ---- Job attachment resolution (resume PDF + cover letter file) ------------
+
+function base64ToUtf8(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+function utf8StringToBase64(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
+
+function stripHtmlToPlain(html) {
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function resolveResumePdfForJob(jobKey) {
+  if (jobKey) {
+    const bucket = await getJobDocumentBucket(jobKey);
+    const edited = bucket && Array.isArray(bucket.editedResumes) ? bucket.editedResumes : [];
+    for (const d of edited) {
+      if (!d || !d.dataBase64) continue;
+      const mime = String(d.mime || "").toLowerCase();
+      const name = String(d.name || "").toLowerCase();
+      if (mime === "application/pdf" || name.endsWith(".pdf")) {
+        return {
+          dataBase64: d.dataBase64,
+          name: d.name || "resume.pdf",
+          mime: d.mime || "application/pdf",
+        };
+      }
+    }
+  }
+  return await getBaseResumePdf();
+}
+
+async function newestCoverLetterDocForJob(jobKey) {
+  if (!jobKey) return null;
+  const bucket = await getJobDocumentBucket(jobKey);
+  const list = bucket && Array.isArray(bucket.coverLetters) ? bucket.coverLetters : [];
+  return list.length ? list[0] : null;
+}
+
+function coverLetterDocToFileData(doc) {
+  if (!doc || !doc.dataBase64) return null;
+  const mime = String(doc.mime || "").toLowerCase();
+  const name = String(doc.name || "cover-letter");
+
+  if (mime === "application/pdf" || name.toLowerCase().endsWith(".pdf")) {
+    return {
+      dataBase64: doc.dataBase64,
+      name: name.toLowerCase().endsWith(".pdf") ? name : name + ".pdf",
+      mime: "application/pdf",
+    };
+  }
+  if (mime === "text/html" || name.toLowerCase().endsWith(".html")) {
+    const html = base64ToUtf8(doc.dataBase64);
+    const plain = stripHtmlToPlain(html);
+    const base = name.replace(/\.html$/i, "") || "cover-letter";
+    return {
+      dataBase64: utf8StringToBase64(plain),
+      name: base + ".txt",
+      mime: "text/plain",
+    };
+  }
+  if (mime === "text/plain" || name.toLowerCase().endsWith(".txt")) {
+    return {
+      dataBase64: doc.dataBase64,
+      name: name.toLowerCase().endsWith(".txt") ? name : name + ".txt",
+      mime: "text/plain",
+    };
+  }
+  try {
+    const plain = stripHtmlToPlain(base64ToUtf8(doc.dataBase64));
+    return {
+      dataBase64: utf8StringToBase64(plain),
+      name: "cover-letter.txt",
+      mime: "text/plain",
+    };
+  } catch (e) {
+    return null;
+  }
+}
 
 async function getProfile() {
   const result = await chrome.storage.local.get(STORAGE_KEYS.PROFILE);
@@ -42,91 +295,136 @@ async function saveBaseResumePdf(pdf) {
   await chrome.storage.local.set({ [STORAGE_KEYS.BASE_RESUME_PDF]: pdf });
 }
 
-async function getAllJobDocuments() {
-  const result = await chrome.storage.local.get(STORAGE_KEYS.JOB_DOCUMENTS);
-  return result[STORAGE_KEYS.JOB_DOCUMENTS] || {};
-}
-
-async function saveAllJobDocuments(allDocs) {
-  await chrome.storage.local.set({ [STORAGE_KEYS.JOB_DOCUMENTS]: allDocs });
-}
-
-function ensureJobBucket(allDocs, jobKey, jobMeta) {
-  if (!allDocs[jobKey]) {
-    allDocs[jobKey] = {
-      jobKey,
-      jobMeta: jobMeta || null,
-      editedResumes: [],
-      coverLetters: [],
-      updatedAt: new Date().toISOString(),
-    };
-  } else {
-    if (jobMeta) allDocs[jobKey].jobMeta = jobMeta;
-    allDocs[jobKey].updatedAt = new Date().toISOString();
-    allDocs[jobKey].editedResumes = Array.isArray(allDocs[jobKey].editedResumes)
-      ? allDocs[jobKey].editedResumes
-      : [];
-    allDocs[jobKey].coverLetters = Array.isArray(allDocs[jobKey].coverLetters)
-      ? allDocs[jobKey].coverLetters
-      : [];
-  }
-  return allDocs[jobKey];
-}
-
 function sortNewestFirst(a, b) {
   return String(b.createdAt || "").localeCompare(String(a.createdAt || ""));
 }
 
-function trimDocsInPlace(bucket) {
+async function getJobDocumentBucket(jobKey) {
+  await ensureArchiveReady();
+  const job = await ArchiveDB.getJob(jobKey);
+  const docs = await ArchiveDB.listDocumentsByJob(jobKey);
+  const bucket = {
+    jobKey: jobKey,
+    jobMeta: job && job.jobMeta ? job.jobMeta : null,
+    editedResumes: [],
+    coverLetters: [],
+    updatedAt: (job && job.updatedAt) || null,
+  };
+
+  for (const doc of docs) {
+    if (doc.docType === "editedResume") bucket.editedResumes.push(doc);
+    else if (doc.docType === "coverLetter") bucket.coverLetters.push(doc);
+  }
   bucket.editedResumes.sort(sortNewestFirst);
   bucket.coverLetters.sort(sortNewestFirst);
-  bucket.editedResumes = bucket.editedResumes.slice(0, MAX_DOCS_PER_JOB_PER_TYPE);
-  bucket.coverLetters = bucket.coverLetters.slice(0, MAX_DOCS_PER_JOB_PER_TYPE);
+  return (bucket.editedResumes.length || bucket.coverLetters.length || bucket.jobMeta) ? bucket : null;
 }
 
-async function getBytesInUseSafe(keys) {
-  try {
-    return await chrome.storage.local.getBytesInUse(keys);
-  } catch (e) {
-    // Some environments may not support getBytesInUse; fall back gracefully.
-    return 0;
-  }
-}
+async function listAllArchivedJobs() {
+  await ensureArchiveReady();
+  const jobs = await ArchiveDB.getAllJobs();
+  const docs = await ArchiveDB.listAllDocuments();
+  const countsByJob = {};
 
-async function enforceStorageSoftCap(allDocs) {
-  // If we’re over the soft cap, trim oldest docs across jobs until under cap.
-  let bytes = await getBytesInUseSafe([STORAGE_KEYS.JOB_DOCUMENTS, STORAGE_KEYS.BASE_RESUME_PDF]);
-  if (!bytes || bytes <= MAX_TOTAL_BYTES_SOFT) return { ok: true, bytes };
-
-  // Build a global list of removable items (oldest first)
-  const removables = [];
-  for (const [jobKey, bucket] of Object.entries(allDocs || {})) {
-    const er = Array.isArray(bucket.editedResumes) ? bucket.editedResumes : [];
-    const cl = Array.isArray(bucket.coverLetters) ? bucket.coverLetters : [];
-    for (const d of er) removables.push({ jobKey, type: "editedResumes", createdAt: d.createdAt || "", id: d.id });
-    for (const d of cl) removables.push({ jobKey, type: "coverLetters", createdAt: d.createdAt || "", id: d.id });
-  }
-  removables.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt))); // oldest first
-
-  let removed = 0;
-  while (bytes > MAX_TOTAL_BYTES_SOFT && removables.length > 0) {
-    const r = removables.shift();
-    const bucket = allDocs[r.jobKey];
-    if (!bucket || !Array.isArray(bucket[r.type])) continue;
-    const before = bucket[r.type].length;
-    bucket[r.type] = bucket[r.type].filter((d) => d && d.id !== r.id);
-    if (bucket[r.type].length !== before) {
-      removed += 1;
-      await saveAllJobDocuments(allDocs);
-      bytes = await getBytesInUseSafe([STORAGE_KEYS.JOB_DOCUMENTS, STORAGE_KEYS.BASE_RESUME_PDF]);
-      if (!bytes) break;
+  for (const doc of docs) {
+    if (!countsByJob[doc.jobKey]) {
+      countsByJob[doc.jobKey] = { editedResumeCount: 0, coverLetterCount: 0 };
     }
+    if (doc.docType === "editedResume") countsByJob[doc.jobKey].editedResumeCount += 1;
+    if (doc.docType === "coverLetter") countsByJob[doc.jobKey].coverLetterCount += 1;
   }
 
-  if (bytes && bytes > MAX_TOTAL_BYTES_SOFT) {
-    return { ok: false, error: "Storage is full; please delete old documents in the popup/options." };
-  }
-  return { ok: true, bytes, removed };
+  return jobs.map(function (job) {
+    var counts = countsByJob[job.jobKey] || { editedResumeCount: 0, coverLetterCount: 0 };
+    return {
+      jobKey: job.jobKey,
+      jobMeta: job.jobMeta || null,
+      updatedAt: job.updatedAt || null,
+      editedResumeCount: counts.editedResumeCount,
+      coverLetterCount: counts.coverLetterCount,
+    };
+  });
+}
+
+async function listDocumentArchive(filters) {
+  await ensureArchiveReady();
+  const docs = await ArchiveDB.listAllDocuments();
+  const jobs = await ArchiveDB.getAllJobs();
+  const jobMap = {};
+  jobs.forEach(function (job) { jobMap[job.jobKey] = job; });
+
+  const normalized = {
+    query: String(filters && filters.query || "").trim().toLowerCase(),
+    docType: String(filters && filters.docType || "").trim(),
+  };
+
+  return docs
+    .map(function (doc) {
+      const job = jobMap[doc.jobKey] || {};
+      return {
+        id: doc.id,
+        jobKey: doc.jobKey,
+        docType: doc.docType,
+        name: doc.name,
+        mime: doc.mime,
+        size: doc.size || 0,
+        createdAt: doc.createdAt || null,
+        jobMeta: job.jobMeta || null,
+        updatedAt: job.updatedAt || doc.createdAt || null,
+      };
+    })
+    .filter(function (item) {
+      if (normalized.docType && item.docType !== normalized.docType) return false;
+      if (!normalized.query) return true;
+      const haystack = [
+        item.name,
+        item.jobKey,
+        item.jobMeta && item.jobMeta.company,
+        item.jobMeta && item.jobMeta.title,
+        item.jobMeta && item.jobMeta.location,
+      ].join(" ").toLowerCase();
+      return haystack.indexOf(normalized.query) !== -1;
+    });
+}
+
+async function getApiUsageDashboard() {
+  await ensureArchiveReady();
+  const summary = (await ArchiveDB.getUsageSummary()) || createEmptyUsageSummary();
+  const events = await ArchiveDB.getAllUsageEvents();
+  const recent = {};
+  const sinceDate = new Date();
+  sinceDate.setDate(sinceDate.getDate() - 13);
+
+  events.forEach(function (eventRecord) {
+    if (!eventRecord.timestamp) return;
+    const eventDate = new Date(eventRecord.timestamp);
+    if (eventDate < sinceDate) return;
+    const day = eventRecord.timestamp.slice(0, 10);
+    if (!recent[day]) recent[day] = { date: day, totalTokens: 0, approxCostUsd: 0, byOperation: {} };
+    if (!recent[day].byOperation[eventRecord.operation]) {
+      recent[day].byOperation[eventRecord.operation] = {
+        requests: 0,
+        totalTokens: 0,
+        approxCostUsd: 0,
+      };
+    }
+    const totalTokens = (Number(eventRecord.promptTokens) || 0) + (Number(eventRecord.completionTokens) || 0);
+    recent[day].totalTokens += totalTokens;
+    recent[day].approxCostUsd = Number((recent[day].approxCostUsd + (Number(eventRecord.approxCostUsd) || 0)).toFixed(6));
+    recent[day].byOperation[eventRecord.operation].requests += 1;
+    recent[day].byOperation[eventRecord.operation].totalTokens += totalTokens;
+    recent[day].byOperation[eventRecord.operation].approxCostUsd = Number((recent[day].byOperation[eventRecord.operation].approxCostUsd + (Number(eventRecord.approxCostUsd) || 0)).toFixed(6));
+  });
+
+  const timeline = Object.values(recent).sort(function (a, b) {
+    return String(a.date).localeCompare(String(b.date));
+  });
+
+  return {
+    summary: summary,
+    timeline: timeline,
+    pricing: cloneJson(MODEL_PRICING),
+  };
 }
 
 async function getApiKey() {
@@ -187,11 +485,18 @@ function stripMarkdownFences(text) {
  * Call OpenAI to map unmatched fields to the profile.
  * Ported from autofill_agent.py map_fields_to_profile (lines 155-183).
  */
-async function llmMapFields(unmatchedFields, profile, resume, apiKey) {
+async function llmMapFields(unmatchedFields, profile, resume, apiKey, formLayoutHint, usageContext) {
   const fullProfile = { applicant_info: profile, resume: resume || {} };
 
+  var pageCtx = "";
+  if (formLayoutHint && typeof formLayoutHint === "object") {
+    pageCtx =
+      "\n\nPAGE CONTEXT (map only fields visible on this page/step; user may need to use Next/Add for other steps):\n" +
+      JSON.stringify(formLayoutHint, null, 2);
+  }
+
   const body = {
-    model: "gpt-4o-mini",
+    model: DEFAULT_OPENAI_MODEL,
     messages: [
       { role: "system", content: FIELD_MAP_PROMPT },
       {
@@ -200,7 +505,8 @@ async function llmMapFields(unmatchedFields, profile, resume, apiKey) {
           "FORM FIELDS:\n" +
           JSON.stringify(unmatchedFields, null, 2) +
           "\n\nAPPLICANT PROFILE:\n" +
-          JSON.stringify(fullProfile, null, 2),
+          JSON.stringify(fullProfile, null, 2) +
+          pageCtx,
       },
     ],
     temperature: 0.1,
@@ -221,6 +527,10 @@ async function llmMapFields(unmatchedFields, profile, resume, apiKey) {
   }
 
   const data = await resp.json();
+  await recordApiUsage(data.usage, "fieldMap", {
+    model: body.model,
+    jobKey: usageContext && usageContext.jobKey,
+  });
   const raw = stripMarkdownFences(data.choices[0].message.content.trim());
 
   try {
@@ -251,7 +561,7 @@ const JD_ANALYSIS_PROMPT =
   '  "key_responsibilities": array — top 4-6 responsibilities as concise action phrases,\n' +
   '  "required_qualifications": array — must-have qualifications; [] if none listed,\n' +
   '  "preferred_qualifications": array — nice-to-have qualifications; [] if none listed,\n' +
-  '  "keywords": array — terms that appear multiple times or carry obvious weight,\n' +
+  '  "keywords": array — technical terms, tools, frameworks, or domain concepts that appear multiple times or carry obvious weight; EXCLUDE the job title, company name, and location (already captured above); [] if none,\n' +
   '  "tone": string — exactly one of: technical | startup | corporate | research | creative,\n' +
   '  "domain": string — exactly one of: backend | frontend | fullstack | ML/AI | data | infra | research | general SWE | other,\n' +
   '  "notes": string — visa sponsorship, clearance, team details, etc.; "" if nothing notable\n' +
@@ -323,7 +633,7 @@ const COVER_LETTER_PROMPT =
  * Shared OpenAI API wrapper — single source of truth for model config,
  * format enforcement, parsing, validation, and retry logic.
  */
-async function callOpenAi({ systemPrompt, userContent, apiKey, expectJson, requiredKeys, temperature }) {
+async function callOpenAi({ systemPrompt, userContent, apiKey, expectJson, requiredKeys, temperature, operation, model, jobKey }) {
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user", content: userContent },
@@ -331,7 +641,7 @@ async function callOpenAi({ systemPrompt, userContent, apiKey, expectJson, requi
 
   async function doFetch(msgs, temp) {
     const body = {
-      model: "gpt-4o-mini",
+      model: model || DEFAULT_OPENAI_MODEL,
       temperature: temp,
       messages: msgs,
     };
@@ -354,6 +664,10 @@ async function callOpenAi({ systemPrompt, userContent, apiKey, expectJson, requi
     }
 
     const data = await resp.json();
+    await recordApiUsage(data.usage, operation, {
+      model: body.model,
+      jobKey: jobKey || "",
+    });
     return data.choices[0].message.content.trim();
   }
 
@@ -405,7 +719,7 @@ async function callOpenAi({ systemPrompt, userContent, apiKey, expectJson, requi
   return parsed;
 }
 
-async function analyzeJd(jdText, apiKey) {
+async function analyzeJd(jdText, apiKey, jobKey) {
   return await callOpenAi({
     systemPrompt: JD_ANALYSIS_PROMPT,
     userContent: jdText,
@@ -413,6 +727,9 @@ async function analyzeJd(jdText, apiKey) {
     expectJson: true,
     requiredKeys: JD_ANALYSIS_REQUIRED_KEYS,
     temperature: 0.1,
+    operation: "jdAnalysis",
+    model: DEFAULT_OPENAI_MODEL,
+    jobKey: jobKey || "",
   });
 }
 
@@ -435,7 +752,7 @@ const REQUIREMENTS_GAP_PROMPT =
   "- Return one result per requirement, in the same order as the input list.\n\n" +
   "IMPORTANT: Return ONLY valid JSON — no markdown fences, no commentary.";
 
-async function llmCheckQualifications(resume, qualifications, skills, keywords, apiKey) {
+async function llmCheckQualifications(resume, qualifications, skills, keywords, apiKey, jobKey) {
   var allRequirements = []
     .concat(qualifications || [])
     .concat((skills || []).map(function (s) { return "Skill: " + s; }))
@@ -456,6 +773,9 @@ async function llmCheckQualifications(resume, qualifications, skills, keywords, 
     expectJson: true,
     requiredKeys: ["results"],
     temperature: 0.1,
+    operation: "gapCheck",
+    model: DEFAULT_OPENAI_MODEL,
+    jobKey: jobKey || "",
   });
 
   var results = parsed.results || [];
@@ -470,7 +790,7 @@ async function llmCheckQualifications(resume, qualifications, skills, keywords, 
   };
 }
 
-async function tailorResume(masterResume, jdAnalysis, apiKey) {
+async function tailorResume(masterResume, jdAnalysis, apiKey, jobKey) {
   const userContent =
     "MASTER RESUME:\n" + JSON.stringify(masterResume, null, 2) + "\n\n" +
     "JOB DESCRIPTION ANALYSIS:\n" + JSON.stringify(jdAnalysis, null, 2) + "\n\n" +
@@ -483,10 +803,13 @@ async function tailorResume(masterResume, jdAnalysis, apiKey) {
     expectJson: true,
     requiredKeys: ["tailored_resume", "requirements_gaps"],
     temperature: 0.2,
+    operation: "tailorResume",
+    model: DEFAULT_OPENAI_MODEL,
+    jobKey: jobKey || "",
   });
 }
 
-async function generateCoverLetterText(masterResume, jdAnalysis, styleProfile, apiKey) {
+async function generateCoverLetterText(masterResume, jdAnalysis, styleProfile, apiKey, jobKey) {
   const userContent =
     "STYLE PROFILE:\n" + styleProfile + "\n\n" +
     "RESUME SUMMARY:\n" + JSON.stringify(masterResume, null, 2) + "\n\n" +
@@ -499,6 +822,9 @@ async function generateCoverLetterText(masterResume, jdAnalysis, styleProfile, a
     apiKey,
     expectJson: false,
     temperature: 0.5,
+    operation: "coverLetter",
+    model: DEFAULT_OPENAI_MODEL,
+    jobKey: jobKey || "",
   });
 
   // Validate paragraph count — if > 3 paragraphs, trim to 3
@@ -580,12 +906,12 @@ async function handleGenerateAiDocuments(msg) {
   const styleProfile = await getStyleProfile();
 
   // Step 1: Analyze JD
-  const jdAnalysis = await analyzeJd(jdText, apiKey);
+  const jdAnalysis = await analyzeJd(jdText, apiKey, msg.jobKey);
 
   // Step 2 & 3: Tailor resume and generate cover letter in parallel
   const [tailorResult, coverLetterText] = await Promise.all([
-    tailorResume(resume, jdAnalysis, apiKey),
-    generateCoverLetterText(resume, jdAnalysis, styleProfile, apiKey),
+    tailorResume(resume, jdAnalysis, apiKey, msg.jobKey),
+    generateCoverLetterText(resume, jdAnalysis, styleProfile, apiKey, msg.jobKey),
   ]);
 
   const tailoredResume = tailorResult.tailored_resume || tailorResult;
@@ -600,6 +926,124 @@ async function handleGenerateAiDocuments(msg) {
     requirementsGaps,
     diff,
   };
+}
+
+function delay(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+function ensurePdfFilename(filename) {
+  var name = String(filename || "document.pdf").trim() || "document.pdf";
+  if (/\.pdf$/i.test(name)) return name;
+  return name.replace(/\.[a-z0-9]+$/i, "") + ".pdf";
+}
+
+function base64ByteLength(base64) {
+  var cleaned = String(base64 || "").replace(/=+$/, "");
+  return Math.floor((cleaned.length * 3) / 4);
+}
+
+function waitForTabComplete(tabId) {
+  return new Promise(function (resolve, reject) {
+    var done = false;
+
+    function finish(err) {
+      if (done) return;
+      done = true;
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      clearTimeout(timeoutId);
+      if (err) reject(err);
+      else resolve();
+    }
+
+    function onUpdated(updatedTabId, info) {
+      if (updatedTabId !== tabId) return;
+      if (info.status === "complete") finish();
+    }
+
+    var timeoutId = setTimeout(function () {
+      finish(new Error("Timed out while waiting for PDF render tab"));
+    }, 10000);
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.get(tabId, function (tab) {
+      if (chrome.runtime.lastError) {
+        finish(chrome.runtime.lastError);
+        return;
+      }
+      if (tab && tab.status === "complete") finish();
+    });
+  });
+}
+
+function debuggerSend(target, method, params) {
+  return new Promise(function (resolve, reject) {
+    chrome.debugger.sendCommand(target, method, params || {}, function (result) {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(result);
+    });
+  });
+}
+
+async function renderHtmlToPdf(msg) {
+  if (!msg.html) return { ok: false, error: "Missing HTML payload" };
+
+  var renderId = genId("render");
+  var sessionKey = "jaf_pdf_render_" + renderId;
+  var target = null;
+  var tab = null;
+
+  try {
+    await chrome.storage.session.set({
+      [sessionKey]: {
+        html: String(msg.html),
+        createdAt: new Date().toISOString(),
+      },
+    });
+
+    tab = await chrome.tabs.create({
+      url: chrome.runtime.getURL("pdf/render.html?renderId=" + encodeURIComponent(renderId)),
+      active: false,
+    });
+    target = { tabId: tab.id };
+
+    await waitForTabComplete(tab.id);
+    await delay(250);
+
+    await chrome.debugger.attach(target, "1.3");
+    try {
+      await debuggerSend(target, "Page.enable");
+      await debuggerSend(target, "Emulation.setEmulatedMedia", { media: "print" });
+      var pdfResult = await debuggerSend(target, "Page.printToPDF", {
+        printBackground: true,
+        preferCSSPageSize: true,
+      });
+      var filename = ensurePdfFilename(msg.filename);
+      return {
+        ok: true,
+        doc: {
+          id: genId("doc"),
+          name: filename,
+          mime: "application/pdf",
+          size: base64ByteLength(pdfResult.data),
+          createdAt: new Date().toISOString(),
+          dataBase64: pdfResult.data,
+        },
+      };
+    } finally {
+      try { await chrome.debugger.detach(target); } catch (detachErr) {}
+    }
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  } finally {
+    if (tab && tab.id) {
+      try { await chrome.tabs.remove(tab.id); } catch (closeErr) {}
+    }
+    try { await chrome.storage.session.remove(sessionKey); } catch (removeErr) {}
+  }
 }
 
 // ---- Message handler -------------------------------------------------------
@@ -646,6 +1090,20 @@ async function handleMessage(msg, sender) {
         styleProfile: await getStyleProfile(),
       };
 
+    case "getApiUsage": {
+      await ensureArchiveReady();
+      return { ok: true, usage: (await ArchiveDB.getUsageSummary()) || createEmptyUsageSummary() };
+    }
+
+    case "resetApiUsage":
+      await ensureArchiveReady();
+      await ArchiveDB.clearStore("apiUsageEvents");
+      await persistUsageSummary(createEmptyUsageSummary());
+      return { ok: true };
+
+    case "getApiUsageDashboard":
+      return { ok: true, dashboard: await getApiUsageDashboard() };
+
     case "saveSettings":
       if (msg.apiKey !== undefined)
         await chrome.storage.local.set({ [STORAGE_KEYS.API_KEY]: msg.apiKey });
@@ -667,21 +1125,10 @@ async function handleMessage(msg, sender) {
 
     case "getJobDocuments":
       if (!msg.jobKey) return { ok: false, error: "Missing jobKey" };
-      const allDocs1 = await getAllJobDocuments();
-      return { ok: true, bucket: allDocs1[msg.jobKey] || null };
+      return { ok: true, bucket: await getJobDocumentBucket(msg.jobKey) };
 
     case "listAllJobs":
-      const allDocs2 = await getAllJobDocuments();
-      return {
-        ok: true,
-        jobs: Object.values(allDocs2).map((b) => ({
-          jobKey: b.jobKey,
-          jobMeta: b.jobMeta || null,
-          updatedAt: b.updatedAt,
-          editedResumeCount: (b.editedResumes || []).length,
-          coverLetterCount: (b.coverLetters || []).length,
-        })),
-      };
+      return { ok: true, jobs: await listAllArchivedJobs() };
 
     case "saveJobDocument":
       if (!msg.jobKey) return { ok: false, error: "Missing jobKey" };
@@ -689,15 +1136,9 @@ async function handleMessage(msg, sender) {
         return { ok: false, error: "Invalid docType" };
       }
       if (!msg.doc || !msg.doc.dataBase64) return { ok: false, error: "Missing document data" };
-      const allDocs3 = await getAllJobDocuments();
-      const bucket = ensureJobBucket(allDocs3, msg.jobKey, msg.jobMeta);
-      if (msg.docType === "editedResume") bucket.editedResumes.unshift(msg.doc);
-      if (msg.docType === "coverLetter") bucket.coverLetters.unshift(msg.doc);
-      trimDocsInPlace(bucket);
-      await saveAllJobDocuments(allDocs3);
-      const cap = await enforceStorageSoftCap(allDocs3);
-      if (!cap.ok) return { ok: false, error: cap.error };
-      return { ok: true, bytesInUse: cap.bytes || null };
+      await ensureArchiveReady();
+      await ArchiveDB.saveJobDocument(msg.jobKey, msg.jobMeta, msg.docType, msg.doc);
+      return { ok: true };
 
     case "deleteJobDocument":
       if (!msg.jobKey) return { ok: false, error: "Missing jobKey" };
@@ -705,24 +1146,40 @@ async function handleMessage(msg, sender) {
         return { ok: false, error: "Invalid docType" };
       }
       if (!msg.id) return { ok: false, error: "Missing id" };
-      const allDocs4 = await getAllJobDocuments();
-      const bucket2 = allDocs4[msg.jobKey];
-      if (!bucket2) return { ok: true };
-      const key = msg.docType === "editedResume" ? "editedResumes" : "coverLetters";
-      bucket2[key] = (bucket2[key] || []).filter((d) => d && d.id !== msg.id);
-      bucket2.updatedAt = new Date().toISOString();
-      await saveAllJobDocuments(allDocs4);
+      await ensureArchiveReady();
+      await ArchiveDB.deleteDocument(msg.id);
       return { ok: true };
+
+    case "listDocumentArchive":
+      return { ok: true, items: await listDocumentArchive(msg.filters || null) };
+
+    case "getArchivedDocument":
+      if (!msg.id) return { ok: false, error: "Missing id" };
+      await ensureArchiveReady();
+      return { ok: true, doc: await ArchiveDB.getDocument(msg.id) };
+
+    case "deleteArchivedDocument":
+      if (!msg.id) return { ok: false, error: "Missing id" };
+      await ensureArchiveReady();
+      await ArchiveDB.deleteDocument(msg.id);
+      return { ok: true };
+
+    case "renderHtmlToPdf":
+      return await renderHtmlToPdf(msg);
 
     case "getLastLog":
       const logResult = await chrome.storage.local.get(STORAGE_KEYS.LAST_FILL_LOG);
       return { ok: true, log: logResult[STORAGE_KEYS.LAST_FILL_LOG] || [] };
 
+    case "openOptionsPage":
+      chrome.runtime.openOptionsPage();
+      return { ok: true };
+
     case "startAutofill":
-      return await handleAutofill(msg);
+      return await handleAutofill(msg, sender);
 
     case "confirmFill":
-      return await handleConfirmFill(msg);
+      return await handleConfirmFill(msg, sender);
 
     case "generateAiDocuments":
       return await handleGenerateAiDocuments(msg);
@@ -761,7 +1218,7 @@ async function handleMessage(msg, sender) {
  * 3. Optionally run LLM for unmatched fields
  * 4. Send preview or fill command to content script
  */
-async function handleAutofill(msg) {
+async function handleAutofill(msg, sender) {
   const profile = await getProfile();
   if (!profile) {
     return { ok: false, error: "No profile configured. Open the Options page to set up your profile." };
@@ -770,8 +1227,9 @@ async function handleAutofill(msg) {
 
   const mode = msg.mode || "preview"; // "preview" or "fill"
 
-  // 1. Get the target tab (from message or fallback to active tab)
+  // 1. Get the target tab (from message, sender, or fallback to active tab)
   var tabId = msg.tabId;
+  if (!tabId && sender && sender.tab) tabId = sender.tab.id;
   if (!tabId) {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     tabId = tab && tab.id;
@@ -799,6 +1257,13 @@ async function handleAutofill(msg) {
 
   const jobKey = scanResult.jobKey || "";
   const jobMeta = scanResult.jobMeta || null;
+  const formLayout = scanResult.formLayout || null;
+  const repeatSectionHints = scanResult.repeatSectionHints || [];
+  const llmPageHint = {
+    formLayout,
+    repeatSectionHints,
+    navButton: scanResult.navButton || null,
+  };
 
   // 3. Rule-based matching (shared module loaded via importScripts)
   let mappings = MatchRules.ruleBasedMatch(fields, profile);
@@ -814,7 +1279,9 @@ async function handleAutofill(msg) {
 
     if (unmatched.length > 0) {
       try {
-        const llmMappings = await llmMapFields(unmatched, profile, resume, apiKey);
+        const llmMappings = await llmMapFields(unmatched, profile, resume, apiKey, llmPageHint, {
+          jobKey: jobKey,
+        });
         // Merge LLM results: replace low-confidence rule-based matches
         for (const lm of llmMappings) {
           const idx = mappings.findIndex((m) => m.selector === lm.selector);
@@ -831,31 +1298,51 @@ async function handleAutofill(msg) {
     }
   }
 
-  // 5. Attach resume file data to file-upload mappings
+  // 5. Attach resume + cover letter file data to file-upload mappings
   const RESUME_FILE_RE = /resume|cv|curriculum/i;
-  const baseResumePdf = await getBaseResumePdf();
-  if (baseResumePdf && baseResumePdf.dataBase64) {
-    for (let i = 0; i < mappings.length; i++) {
-      const m = mappings[i];
-      const field = fields.find((f) => f.selector === m.selector);
-      if (!field) continue;
-      const isFileField = field.type === "file";
-      const isFileUploadValue = m.value === "__FILE_UPLOAD__";
-      if (isFileField || isFileUploadValue) {
-        const context = [field.label, field.name, field.id, field.aria_label, field.nearby_text].join(" ");
-        if (RESUME_FILE_RE.test(context) || isFileUploadValue) {
-          mappings[i] = {
-            ...m,
-            value: "__FILE_UPLOAD__",
-            confidence: 1.0,
-            __fileData: {
-              dataBase64: baseResumePdf.dataBase64,
-              name: baseResumePdf.name || "resume.pdf",
-              mime: baseResumePdf.mime || "application/pdf",
-            },
-          };
-        }
-      }
+  const COVER_LETTER_FILE_RE = /cover\s*letter|letter\s*of|motivation|supporting\s*document/i;
+
+  const resumePdf = await resolveResumePdfForJob(jobKey);
+  const coverDoc = await newestCoverLetterDocForJob(jobKey);
+  const coverFileData = coverDoc ? coverLetterDocToFileData(coverDoc) : null;
+
+  for (let i = 0; i < mappings.length; i++) {
+    const m = mappings[i];
+    const field = fields.find((f) => f.selector === m.selector);
+    if (!field) continue;
+    const isFileField = field.type === "file";
+    const isFileUploadValue = m.value === "__FILE_UPLOAD__";
+    if (!isFileField && !isFileUploadValue) continue;
+
+    const context = [field.label, field.name, field.id, field.aria_label, field.nearby_text].join(" ");
+
+    if (coverFileData && COVER_LETTER_FILE_RE.test(context)) {
+      mappings[i] = {
+        ...m,
+        value: "__FILE_UPLOAD__",
+        confidence: 1.0,
+        __fileData: {
+          dataBase64: coverFileData.dataBase64,
+          name: coverFileData.name || "cover-letter.txt",
+          mime: coverFileData.mime || "text/plain",
+        },
+      };
+      continue;
+    }
+
+    if (COVER_LETTER_FILE_RE.test(context)) continue;
+
+    if (resumePdf && resumePdf.dataBase64 && (RESUME_FILE_RE.test(context) || isFileUploadValue)) {
+      mappings[i] = {
+        ...m,
+        value: "__FILE_UPLOAD__",
+        confidence: 1.0,
+        __fileData: {
+          dataBase64: resumePdf.dataBase64,
+          name: resumePdf.name || "resume.pdf",
+          mime: resumePdf.mime || "application/pdf",
+        },
+      };
     }
   }
 
@@ -871,6 +1358,8 @@ async function handleAutofill(msg) {
       mode: "preview",
       mappings: mappings,
       navButton: scanResult.navButton,
+      formLayout,
+      repeatSectionHints,
       adapterName: scanResult.adapterName,
       fieldCount: fields.length,
       jobKey,
@@ -880,11 +1369,20 @@ async function handleAutofill(msg) {
 
   // Direct fill (skip preview)
   const filled = await executeFillOnTab(tabId, mappings);
-  return { ...filled, jobKey, jobMeta };
+  return {
+    ...filled,
+    jobKey,
+    jobMeta,
+    navButton: scanResult.navButton,
+    formLayout,
+    repeatSectionHints,
+    fieldCount: fields.length,
+  };
 }
 
-async function handleConfirmFill(msg) {
+async function handleConfirmFill(msg, sender) {
   var targetTabId = msg.tabId;
+  if (!targetTabId && sender && sender.tab) targetTabId = sender.tab.id;
   if (!targetTabId) {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     targetTabId = tab && tab.id;
@@ -979,11 +1477,20 @@ async function handleAnalyzeResumeGaps(msg) {
 
   let jdAnalysis;
   try {
-    jdAnalysis = await analyzeJd(jdText, apiKey);
+    jdAnalysis = await analyzeJd(jdText, apiKey, msg.jobKey);
   } catch (err) {
     console.error("[JobAutofill BG] JD analysis failed:", err);
     return { ok: false, error: "JD analysis failed: " + (err.message || String(err)) };
   }
+
+  // Filter out keywords that duplicate the role or company name
+  var filteredKeywords = (jdAnalysis.keywords || []).filter(function (kw) {
+    var lower = kw.toLowerCase();
+    var role = (jdAnalysis.role || "").toLowerCase();
+    var company = (jdAnalysis.company || "").toLowerCase();
+    return lower !== role && lower !== company
+        && role.indexOf(lower) === -1 && company.indexOf(lower) === -1;
+  });
 
   // LLM-powered gap check — sends resume + all extracted requirements to GPT
   let gapCheck;
@@ -992,8 +1499,9 @@ async function handleAnalyzeResumeGaps(msg) {
       resume,
       jdAnalysis.required_qualifications || [],
       jdAnalysis.hard_skills || [],
-      jdAnalysis.keywords || [],
-      apiKey
+      filteredKeywords,
+      apiKey,
+      msg.jobKey
     );
   } catch (err) {
     console.error("[JobAutofill BG] LLM gap check failed:", err);
@@ -1067,8 +1575,8 @@ async function handleExecuteResumeOptimization(msg) {
   let tailorResult, coverLetterText;
   try {
     [tailorResult, coverLetterText] = await Promise.all([
-      tailorResume(resume, jdAnalysis, apiKey),
-      generateCoverLetterText(resume, jdAnalysis, styleProfile, apiKey),
+      tailorResume(resume, jdAnalysis, apiKey, msg.jobKey),
+      generateCoverLetterText(resume, jdAnalysis, styleProfile, apiKey, msg.jobKey),
     ]);
   } catch (err) {
     console.error("[JobAutofill BG] Resume optimization failed:", err);
@@ -1089,13 +1597,6 @@ async function handleExecuteResumeOptimization(msg) {
   };
 }
 
-// ---- Tab opener (opens popup.html in a new tab per job page) ----------------
-
-chrome.action.onClicked.addListener(function (tab) {
-  var url = chrome.runtime.getURL("popup/popup.html") + "?originTabId=" + tab.id;
-  chrome.tabs.create({ url: url });
-});
-
 // ---- Standalone cover letter generation ------------------------------------
 
 async function handleGenerateCoverLetter(msg) {
@@ -1113,7 +1614,7 @@ async function handleGenerateCoverLetter(msg) {
 
   let jdAnalysis;
   try {
-    jdAnalysis = await analyzeJd(jdText, apiKey);
+    jdAnalysis = await analyzeJd(jdText, apiKey, msg.jobKey);
   } catch (err) {
     return { ok: false, error: "JD analysis failed: " + (err.message || String(err)) };
   }
@@ -1121,7 +1622,7 @@ async function handleGenerateCoverLetter(msg) {
   const styleProfile = await getStyleProfile();
   let coverLetterText;
   try {
-    coverLetterText = await generateCoverLetterText(resume, jdAnalysis, styleProfile, apiKey);
+    coverLetterText = await generateCoverLetterText(resume, jdAnalysis, styleProfile, apiKey, msg.jobKey);
   } catch (err) {
     return { ok: false, error: "Cover letter generation failed: " + (err.message || String(err)) };
   }
