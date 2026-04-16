@@ -358,26 +358,32 @@ window.JobAutofill = window.JobAutofill || {};
    * Execute the fill using current or provided mappings.
    */
   function handleFill(mappings, sendResponse) {
-    try {
+    Promise.resolve().then(async function () {
       var toFill = mappings || currentMappings;
       if (!toFill || toFill.length === 0) {
         sendResponse({ ok: false, error: "No mappings to fill" });
         return;
       }
 
-      // Clear any existing preview
       JA.clearPreview();
 
-      // Get the adapter for possible fill overrides
       var adapter = JA.adapterRegistry
         ? JA.adapterRegistry.getAdapter(window.location.href)
         : null;
 
+      if (adapter && typeof adapter.beforeFill === "function") {
+        await Promise.resolve(adapter.beforeFill(toFill));
+      }
+
       var results;
       if (adapter && adapter.fillFields) {
-        results = adapter.fillFields(toFill);
+        results = await Promise.resolve(adapter.fillFields(toFill));
       } else {
-        results = JA.fillFields(toFill);
+        results = await Promise.resolve(JA.fillFields(toFill));
+      }
+
+      if (adapter && typeof adapter.afterFill === "function") {
+        await Promise.resolve(adapter.afterFill(toFill, results));
       }
 
       JA.log(
@@ -397,10 +403,10 @@ window.JobAutofill = window.JobAutofill || {};
         skipped: results.skipped,
         log: JA.getLog(),
       });
-    } catch (err) {
+    }).catch(function (err) {
       JA.log("ERROR", "Fill failed: " + err);
       sendResponse({ ok: false, error: String(err) });
-    }
+    });
   }
 
   JA.extractJobMeta = extractJobMeta;

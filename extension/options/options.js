@@ -176,7 +176,7 @@
         const resp = await sendBg({ action: "saveBaseResumePdf", pdf });
         if (resp.ok) {
           showStatus("baseResumePdfStatus", "Base resume PDF saved.", true);
-          renderBaseResumePdfMeta(pdf);
+          renderBaseResumePdfMeta(resp.pdf || pdf);
         } else {
           showStatus("baseResumePdfStatus", resp.error || "Save failed.", false);
         }
@@ -449,7 +449,8 @@
         showStatus("archiveStatus", resp.error || "Document not found.", false, false);
         return;
       }
-      downloadBase64File(resp.doc.dataBase64, resp.doc.name || "document.pdf", resp.doc.mime || "application/octet-stream");
+      const payload = preferredDownloadDoc(resp.doc);
+      downloadBase64File(payload.dataBase64, payload.name || "document.pdf", payload.mime || "application/octet-stream");
       showStatus("archiveStatus", "Download started.", true, true);
       return;
     }
@@ -510,6 +511,19 @@
     return next;
   }
 
+  function preferredDownloadDoc(doc) {
+    if (!doc) return null;
+    if (doc.derivedPdf && doc.derivedPdf.dataBase64) return doc.derivedPdf;
+    if (doc.sourcePdfDataBase64) {
+      return {
+        dataBase64: doc.sourcePdfDataBase64,
+        name: doc.sourcePdfName || "resume.pdf",
+        mime: doc.sourcePdfMime || "application/pdf",
+      };
+    }
+    return doc;
+  }
+
   function renderBaseResumePdfMeta(meta) {
     const el = document.getElementById("baseResumePdfMeta");
     const btnDownload = document.getElementById("btnDownloadBaseResumePdf");
@@ -520,8 +534,14 @@
       btnClear.disabled = true;
       return;
     }
-    el.textContent = "Stored: " + (meta.name || "resume.pdf") + " (" + formatBytes(meta.size || 0) + ") • " +
-      (meta.createdAt ? new Date(meta.createdAt).toLocaleString() : "");
+    var details = [
+      "Stored: " + (meta.name || "resume.pdf"),
+      "(" + formatBytes(meta.size || 0) + ")",
+      meta.createdAt ? new Date(meta.createdAt).toLocaleString() : "",
+    ];
+    if (meta.hasCanonicalHtml) details.push("converted to editable HTML");
+    if (meta.canonicalPageCount) details.push(meta.canonicalPageCount + "-page source");
+    el.textContent = details.filter(Boolean).join(" • ");
     btnDownload.disabled = false;
     btnClear.disabled = false;
   }

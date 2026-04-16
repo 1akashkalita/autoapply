@@ -35,6 +35,14 @@ window.JobAutofill = window.JobAutofill || {};
           .replace(/[-_]/g, " ")
           .replace(/\b\w/g, function (c) { return c.toUpperCase(); });
       }
+
+      if (f.control_kind === "custom_select") {
+        f.interaction = f.interaction || { kind: "custom_select" };
+        f.interaction.provider = "workday";
+        if (!f.interaction.listboxId && f.id) {
+          f.interaction.listboxId = f.id + "-listbox";
+        }
+      }
     }
 
     return fields;
@@ -46,7 +54,10 @@ window.JobAutofill = window.JobAutofill || {};
    * This is a stub for future implementation.
    */
   adapter.beforeFill = function () {
-    // Future: expand collapsed sections, dismiss cookie banners, etc.
+    var dismissors = document.querySelectorAll('[aria-label*="close" i], button[data-automation-id*="close" i]');
+    Array.from(dismissors).slice(0, 2).forEach(function (el) {
+      try { el.click(); } catch (e) {}
+    });
   };
 
   adapter.resolveFileUploadTarget = function (docType) {

@@ -16,7 +16,8 @@ window.JobAutofill.prompts = {
     '{ "field_label": "...", "selector": "...", "value": "...", "confidence": 0.0-1.0 }\n\n' +
     "Rules:\n" +
     "- Use EXACT selector strings from the field list — never invent selectors.\n" +
-    "- For <select> fields the value MUST be one of the provided option values.\n" +
+    "- For native_select fields the value MUST be one of the provided option values.\n" +
+    "- For custom_select fields choose ONLY a provided option text/value when options are available. Never return free text for a dropdown.\n" +
     '- For file-upload fields set value to "__FILE_UPLOAD__" with confidence 1.0.\n' +
     '- Set confidence < 0.8 and value "__PAUSE__" for anything ambiguous or not in the profile.\n' +
     "- Return ONLY a JSON array, no markdown fences, no commentary.",

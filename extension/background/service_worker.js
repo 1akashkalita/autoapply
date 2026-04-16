@@ -4,7 +4,11 @@
  * profile storage management, and optional OpenAI API integration.
  */
 
-importScripts("../shared/match_rules.js", "../shared/archive_db.js");
+importScripts("../vendor/pdf.min.js", "../shared/match_rules.js", "../shared/archive_db.js");
+
+if (self.pdfjsLib && self.pdfjsLib.GlobalWorkerOptions) {
+  self.pdfjsLib.GlobalWorkerOptions.workerSrc = null;
+}
 
 // ---- Storage helpers -------------------------------------------------------
 
@@ -300,24 +304,308 @@ function stripHtmlToPlain(html) {
     .trim();
 }
 
+function escapeHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function safeFileStem(name, fallback) {
+  var stem = String(name || "").replace(/\.[a-z0-9]+$/i, "").trim();
+  stem = stem.replace(/[\/\\?%*:|"<>]/g, "").replace(/\s+/g, "-");
+  return stem || fallback || "resume";
+}
+
+function canonicalResumeHtmlName(name) {
+  return safeFileStem(name, "resume") + ".html";
+}
+
+function canonicalResumePdfName(name) {
+  return safeFileStem(name, "resume") + ".pdf";
+}
+
+function normalizeComparableText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/\u2022/g, " ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeComparableText(text) {
+  return normalizeComparableText(text).split(" ").filter(Boolean);
+}
+
+function comparableOverlapScore(a, b) {
+  var left = tokenizeComparableText(a);
+  var right = tokenizeComparableText(b);
+  if (!left.length || !right.length) return 0;
+  var rightSet = {};
+  right.forEach(function (token) { rightSet[token] = true; });
+  var matches = 0;
+  left.forEach(function (token) {
+    if (rightSet[token]) matches += 1;
+  });
+  return matches / Math.max(left.length, right.length);
+}
+
+function buildPdfResumeLines(textItems, styles, viewport) {
+  var lines = [];
+  var tolerance = 3;
+
+  function finalizeLine(rawLine) {
+    if (!rawLine || !rawLine.items || !rawLine.items.length) return null;
+    rawLine.items.sort(function (a, b) { return a.left - b.left; });
+    var parts = [];
+    var previousRight = null;
+    rawLine.items.forEach(function (item) {
+      var text = String(item.text || "");
+      if (!text) return;
+      if (previousRight !== null && item.left - previousRight > Math.max(4, item.fontSize * 0.35)) {
+        parts.push(" ");
+      }
+      parts.push(text);
+      previousRight = item.left + item.width;
+    });
+
+    var text = parts.join("").replace(/\s+/g, " ").trim();
+    if (!text) return null;
+
+    var first = rawLine.items[0];
+    var last = rawLine.items[rawLine.items.length - 1];
+    var top = rawLine.items.reduce(function (acc, item) { return Math.min(acc, item.top); }, rawLine.items[0].top);
+    var bottom = rawLine.items.reduce(function (acc, item) { return Math.max(acc, item.top + item.height); }, rawLine.items[0].top + rawLine.items[0].height);
+    var left = first.left;
+    var right = rawLine.items.reduce(function (acc, item) { return Math.max(acc, item.left + item.width); }, last.left + last.width);
+    var width = Math.max(120, viewport.width - left - 12, right - left + 12);
+    var fontSize = rawLine.items.reduce(function (acc, item) { return Math.max(acc, item.fontSize); }, first.fontSize || 11);
+    var lineHeight = Math.max(fontSize * 1.15, bottom - top + 2);
+
+    return {
+      id: "line_" + (lines.length + 1),
+      text: text,
+      left: Number(left.toFixed(2)),
+      top: Number(top.toFixed(2)),
+      width: Number(width.toFixed(2)),
+      height: Number(lineHeight.toFixed(2)),
+      fontSize: Number(fontSize.toFixed(2)),
+      fontFamily: first.fontFamily || "Helvetica, Arial, sans-serif",
+      fontWeight: first.fontWeight || "400",
+      fontStyle: first.fontStyle || "normal",
+    };
+  }
+
+  (textItems || []).forEach(function (item) {
+    var tx = self.pdfjsLib && self.pdfjsLib.Util
+      ? self.pdfjsLib.Util.transform(viewport.transform, item.transform)
+      : item.transform;
+    var fontSize = Math.max(8, Math.sqrt((tx[0] * tx[0]) + (tx[1] * tx[1])) || Math.abs(item.height || 11));
+    var left = tx[4];
+    var top = tx[5] - fontSize;
+    var width = Math.max(8, Number(item.width || 0));
+    var style = styles && item.fontName ? (styles[item.fontName] || {}) : {};
+    var fontFamily = style.fontFamily || "Helvetica, Arial, sans-serif";
+    var fontWeight = /bold/i.test(fontFamily) ? "700" : "400";
+    var fontStyle = /italic|oblique/i.test(fontFamily) ? "italic" : "normal";
+
+    if (!String(item.str || "").trim()) return;
+
+    var target = null;
+    for (var i = 0; i < lines.length; i++) {
+      if (Math.abs(lines[i].top - top) <= tolerance) {
+        target = lines[i];
+        break;
+      }
+    }
+    if (!target) {
+      target = { top: top, items: [] };
+      lines.push(target);
+    }
+    target.items.push({
+      text: item.str,
+      left: left,
+      top: top,
+      width: width,
+      height: Math.max(fontSize, Math.abs(item.height || fontSize)),
+      fontSize: fontSize,
+      fontFamily: fontFamily,
+      fontWeight: fontWeight,
+      fontStyle: fontStyle,
+    });
+  });
+
+  return lines
+    .sort(function (a, b) { return a.top - b.top; })
+    .map(finalizeLine)
+    .filter(Boolean);
+}
+
+function buildCanonicalResumeHtml(meta) {
+  var page = meta.page || { width: 612, height: 792 };
+  var linesHtml = (meta.lines || []).map(function (line) {
+    var width = Math.max(80, Number(line.width || 160));
+    var style =
+      "left:" + Number(line.left || 0).toFixed(2) + "px;" +
+      "top:" + Number(line.top || 0).toFixed(2) + "px;" +
+      "width:" + width.toFixed(2) + "px;" +
+      "min-height:" + Number(line.height || line.fontSize || 12).toFixed(2) + "px;" +
+      "font-size:" + Number(line.fontSize || 11).toFixed(2) + "px;" +
+      "font-family:" + escapeHtml(line.fontFamily || "Helvetica, Arial, sans-serif") + ";" +
+      "font-weight:" + escapeHtml(line.fontWeight || "400") + ";" +
+      "font-style:" + escapeHtml(line.fontStyle || "normal") + ";";
+    return '<div class="jaf-resume-line jaf-editable-line" data-line-id="' + escapeHtml(line.id) + '" style="' + style + '">' +
+      escapeHtml(line.text || "") +
+      "</div>";
+  }).join("\n");
+
+  return "<!DOCTYPE html>\n" +
+    '<html lang="en">\n<head>\n<meta charset="UTF-8">\n<title>Resume</title>\n<style>\n' +
+    "@page{size:letter;margin:0;}\n" +
+    "html,body{margin:0;padding:0;background:#fff;}\n" +
+    "body{font-family:Helvetica,Arial,sans-serif;}\n" +
+    '.resume-page{position:relative;width:' + Number(page.width || 612).toFixed(2) + "px;height:" + Number(page.height || 792).toFixed(2) + 'px;overflow:hidden;background:#fff;color:#111;}\n' +
+    ".jaf-resume-line{position:absolute;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.18;transform-origin:left top;}\n" +
+    "</style>\n</head>\n<body>\n" +
+    '<div class="resume-page" data-jaf-page-height="' + escapeHtml(String(page.height || 792)) + '">' + linesHtml + "</div>\n" +
+    '<script type="application/json" id="jaf-resume-meta">' + escapeHtml(JSON.stringify(meta)) + "</script>\n" +
+    "</body>\n</html>";
+}
+
+function extractCanonicalResumeMeta(html) {
+  var match = String(html || "").match(/<script[^>]+id=["']jaf-resume-meta["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (!match) return null;
+  var payload = match[1]
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+  try {
+    return JSON.parse(payload);
+  } catch (err) {
+    return null;
+  }
+}
+
+function resumeTextFromCanonicalHtml(html) {
+  var meta = extractCanonicalResumeMeta(html);
+  if (meta && Array.isArray(meta.lines) && meta.lines.length) {
+    return meta.lines.map(function (line) { return String(line.text || "").trim(); }).filter(Boolean).join("\n");
+  }
+  return stripHtmlToPlain(html);
+}
+
+function canonicalHtmlSourceForDoc(doc) {
+  if (!doc) return null;
+  if (doc.canonicalHtmlBase64) {
+    return {
+      name: doc.canonicalHtmlName || canonicalResumeHtmlName(doc.name),
+      dataBase64: doc.canonicalHtmlBase64,
+      mime: "text/html",
+    };
+  }
+  if (String(doc.mime || "").toLowerCase() === "text/html" && doc.dataBase64) {
+    return {
+      name: doc.name || canonicalResumeHtmlName("resume"),
+      dataBase64: doc.dataBase64,
+      mime: "text/html",
+    };
+  }
+  return null;
+}
+
+async function convertResumePdfToCanonicalAssets(pdfDoc) {
+  if (!pdfDoc || !pdfDoc.dataBase64) {
+    throw new Error("Missing resume PDF data");
+  }
+  if (!self.pdfjsLib || typeof self.pdfjsLib.getDocument !== "function") {
+    throw new Error("PDF parser unavailable");
+  }
+
+  var loadingTask = self.pdfjsLib.getDocument({
+    data: base64ToBytes(pdfDoc.dataBase64),
+    disableWorker: true,
+    useSystemFonts: true,
+  });
+  var pdf = await loadingTask.promise;
+  if ((pdf.numPages || 0) !== 1) {
+    throw new Error("Only one-page resumes are supported. Upload a one-page PDF.");
+  }
+
+  var page = await pdf.getPage(1);
+  var viewport = page.getViewport({ scale: 1 });
+  var textContent = await page.getTextContent({
+    normalizeWhitespace: false,
+    disableCombineTextItems: false,
+  });
+  var lines = buildPdfResumeLines(textContent.items || [], textContent.styles || {}, viewport);
+  if (!lines.length) {
+    throw new Error("Could not extract editable text from the resume PDF.");
+  }
+
+  var meta = {
+    version: 1,
+    source: "pdf-import",
+    page: {
+      width: Number(viewport.width.toFixed(2)),
+      height: Number(viewport.height.toFixed(2)),
+    },
+    lines: lines,
+  };
+  var html = buildCanonicalResumeHtml(meta);
+  return {
+    canonicalHtmlName: canonicalResumeHtmlName(pdfDoc.name),
+    canonicalHtmlBase64: utf8StringToBase64(html),
+    canonicalHtmlPageCount: 1,
+    sourcePdfName: pdfDoc.name || canonicalResumePdfName("resume"),
+    sourcePdfMime: pdfDoc.mime || "application/pdf",
+    sourcePdfDataBase64: pdfDoc.dataBase64,
+    sourcePdfSize: pdfDoc.size || base64ByteLength(pdfDoc.dataBase64),
+  };
+}
+
+function extractResumeDownloadPayload(doc) {
+  if (!doc) return null;
+  if (doc.derivedPdf && doc.derivedPdf.dataBase64) {
+    return {
+      dataBase64: doc.derivedPdf.dataBase64,
+      name: doc.derivedPdf.name || canonicalResumePdfName(doc.name),
+      mime: doc.derivedPdf.mime || "application/pdf",
+    };
+  }
+  if (doc.sourcePdfDataBase64) {
+    return {
+      dataBase64: doc.sourcePdfDataBase64,
+      name: doc.sourcePdfName || canonicalResumePdfName(doc.name),
+      mime: doc.sourcePdfMime || "application/pdf",
+    };
+  }
+  if (String(doc.mime || "").toLowerCase() === "application/pdf" && doc.dataBase64) {
+    return {
+      dataBase64: doc.dataBase64,
+      name: doc.name || canonicalResumePdfName("resume"),
+      mime: doc.mime || "application/pdf",
+    };
+  }
+  return null;
+}
+
 async function resolveResumePdfForJob(jobKey) {
   if (jobKey) {
     const bucket = await getJobDocumentBucket(jobKey);
     const edited = bucket && Array.isArray(bucket.editedResumes) ? bucket.editedResumes : [];
     for (const d of edited) {
-      if (!d || !d.dataBase64) continue;
-      const mime = String(d.mime || "").toLowerCase();
-      const name = String(d.name || "").toLowerCase();
-      if (mime === "application/pdf" || name.endsWith(".pdf")) {
-        return {
-          dataBase64: d.dataBase64,
-          name: d.name || "resume.pdf",
-          mime: d.mime || "application/pdf",
-        };
-      }
+      const payload = extractResumeDownloadPayload(d);
+      if (payload) return payload;
     }
   }
-  return await getBaseResumePdf();
+  var basePdf = await getBaseResumePdf();
+  if (!basePdf) return null;
+  return extractResumeDownloadPayload(basePdf) || basePdf;
 }
 
 async function newestCoverLetterDocForJob(jobKey) {
@@ -384,7 +672,14 @@ async function getBaseResumePdf() {
 }
 
 async function saveBaseResumePdf(pdf) {
-  await chrome.storage.local.set({ [STORAGE_KEYS.BASE_RESUME_PDF]: pdf });
+  var prepared = cloneJson(pdf) || {};
+  var mime = String(prepared.mime || "").toLowerCase();
+  if (mime === "application/pdf" && prepared.dataBase64) {
+    var assets = await convertResumePdfToCanonicalAssets(prepared);
+    prepared = mergeObjects(prepared, assets);
+  }
+  await chrome.storage.local.set({ [STORAGE_KEYS.BASE_RESUME_PDF]: prepared });
+  return prepared;
 }
 
 async function sha256HexForBase64(dataBase64) {
@@ -479,16 +774,22 @@ async function getJobDocumentBucket(jobKey) {
     bucket.activeResume = {
       sourceType: "jobResumePdf",
       sourceName: bucket.editedResumes[0].name || "Active job resume",
+      sourceFormat: bucket.editedResumes[0].mime === "text/html" ? "html" : "pdf",
+      hasCanonicalHtml: !!(bucket.editedResumes[0].canonicalHtmlBase64 || bucket.editedResumes[0].mime === "text/html"),
     };
   } else if (basePdf && basePdf.dataBase64) {
     bucket.activeResume = {
       sourceType: "baseResumePdf",
       sourceName: basePdf.name || "Base resume PDF",
+      sourceFormat: basePdf.canonicalHtmlBase64 ? "html" : "pdf",
+      hasCanonicalHtml: !!basePdf.canonicalHtmlBase64,
     };
   } else if (storedResume) {
     bucket.activeResume = {
       sourceType: "optionsResumeJson",
       sourceName: "Resume JSON from Options",
+      sourceFormat: "json",
+      hasCanonicalHtml: false,
     };
   }
   return (bucket.editedResumes.length || bucket.coverLetters.length || bucket.jobMeta || bucket.activeResume) ? bucket : null;
@@ -541,7 +842,7 @@ async function listDocumentArchive(filters) {
         docType: doc.docType,
         name: doc.name,
         mime: doc.mime,
-        size: doc.size || 0,
+        size: (doc.derivedPdf && doc.derivedPdf.size) || doc.sourcePdfSize || doc.size || 0,
         createdAt: doc.createdAt || null,
         jobMeta: job.jobMeta || null,
         updatedAt: job.updatedAt || doc.createdAt || null,
@@ -765,7 +1066,8 @@ const FIELD_MAP_PROMPT =
   '{ "field_label": "...", "selector": "...", "value": "...", "confidence": 0.0-1.0 }\n\n' +
   "Rules:\n" +
   "- Use EXACT selector strings from the field list — never invent selectors.\n" +
-  "- For <select> fields the value MUST be one of the provided option values.\n" +
+  "- For native_select fields the value MUST be one of the provided option values.\n" +
+  "- For custom_select fields choose ONLY a provided option text/value when options are available. Never return free text for a dropdown.\n" +
   '- For file-upload fields set value to "__FILE_UPLOAD__" with confidence 1.0.\n' +
   '- Set confidence < 0.8 and value "__PAUSE__" for anything ambiguous or not in the profile.\n' +
   "- Return ONLY a JSON array, no markdown fences, no commentary.";
@@ -774,6 +1076,60 @@ function stripMarkdownFences(text) {
   const match = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (match) return match[1].trim();
   return text.trim();
+}
+
+function normalizeDropdownMappingValue(field, rawValue) {
+  var value = String(rawValue || "").trim();
+  if (!value || value === "__PAUSE__") return "";
+  var options = Array.isArray(field && field.options) ? field.options : [];
+  var normalizedValue = normalizeComparableText(value);
+
+  if (!options.length) {
+    return field && field.control_kind === "custom_select" ? value : "";
+  }
+
+  for (var i = 0; i < options.length; i++) {
+    var option = options[i] || {};
+    if (normalizeComparableText(option.value) === normalizedValue || normalizeComparableText(option.text) === normalizedValue) {
+      return field.control_kind === "native_select" ? String(option.value || "") : String(option.text || option.value || "");
+    }
+  }
+
+  return "";
+}
+
+function attachFieldMetadataToMappings(fields, mappings) {
+  var bySelector = {};
+  (fields || []).forEach(function (field) {
+    if (field && field.selector) bySelector[field.selector] = field;
+  });
+
+  return (mappings || []).map(function (mapping) {
+    var field = mapping && mapping.selector ? bySelector[mapping.selector] : null;
+    if (!field) return mapping;
+
+    var next = mergeObjects(mapping || {}, {
+      control_kind: field.control_kind || "",
+      tag: field.tag || "",
+      options: cloneJson(field.options || []),
+      interaction: cloneJson(field.interaction || null),
+    });
+
+    if (field.control_kind === "native_select" || field.control_kind === "custom_select") {
+      var normalized = normalizeDropdownMappingValue(field, mapping.value);
+      if (normalized) {
+        next.value = normalized;
+      } else if (String(mapping.value || "").trim()) {
+        next.reason = field.control_kind === "native_select"
+          ? "option not found"
+          : "unsupported or unmatched dropdown option";
+        next.confidence = Math.min(Number(mapping.confidence) || 0, 0.3);
+        next.value = "";
+      }
+    }
+
+    return next;
+  });
 }
 
 /**
@@ -831,7 +1187,7 @@ async function llmMapFields(unmatchedFields, profile, resume, apiKey, formLayout
   try {
     const mappings = JSON.parse(raw);
     if (!Array.isArray(mappings)) return [];
-    return mappings;
+    return attachFieldMetadataToMappings(unmatchedFields, mappings);
   } catch (e) {
     console.warn("[JobAutofill] LLM returned invalid JSON:", raw.substring(0, 300));
     return [];
@@ -963,6 +1319,27 @@ const COVER_LETTER_PROMPT =
   "- Opening: lead with something specific about the company or role.\n" +
   '- Closing: one confident sentence. No "thank you for your consideration" filler.\n\n' +
   "IMPORTANT: Return ONLY the cover letter text, nothing else.";
+
+const COVER_LETTER_SHORTEN_PROMPT =
+  "ROLE: You are editing a cover letter to fit on exactly one printed page.\n\n" +
+  "TASK: Rewrite the letter more compactly while preserving the same truthful claims, tone, company/role specificity, and concrete evidence.\n\n" +
+  "RULES:\n" +
+  "- Keep the same overall meaning.\n" +
+  "- Remove filler, repeated setup, and unnecessary transitions.\n" +
+  "- Use 2-3 short paragraphs max.\n" +
+  "- Keep it human and specific.\n" +
+  "- Return ONLY the revised cover letter text.";
+
+const RESUME_EDITS_SHORTEN_PROMPT =
+  "ROLE: You are tightening resume bullet edits to preserve a fixed one-page layout.\n\n" +
+  "TASK: Rewrite only the edited headlines and bullet texts more compactly while keeping them truthful, specific, and aligned to the job description.\n\n" +
+  "OUTPUT: Return ONLY valid JSON with the exact same shape and ids as the provided candidate_edits object.\n\n" +
+  "RULES:\n" +
+  "- Keep all ids unchanged.\n" +
+  "- Do not add or remove bullets, items, or sections.\n" +
+  "- Keep the same meaning and evidence.\n" +
+  "- Prefer shorter phrasing, fewer filler words, and tighter verbs.\n" +
+  "- Return ONLY valid JSON.";
 
 /**
  * Shared OpenAI API wrapper — single source of truth for model config,
@@ -1198,6 +1575,43 @@ async function generateCoverLetterText(masterResume, jdAnalysis, styleProfile, a
   return text;
 }
 
+async function shortenCoverLetterText(coverLetterText, jdAnalysis, styleProfile, apiKey, jobKey) {
+  const userContent =
+    "STYLE PROFILE:\n" + styleProfile + "\n\n" +
+    "JOB DESCRIPTION ANALYSIS:\n" + JSON.stringify(jdAnalysis || {}, null, 2) + "\n\n" +
+    "CURRENT COVER LETTER:\n" + String(coverLetterText || "").trim();
+
+  return await callOpenAi({
+    systemPrompt: COVER_LETTER_SHORTEN_PROMPT,
+    userContent,
+    apiKey,
+    expectJson: false,
+    temperature: 0.2,
+    operation: "coverLetter",
+    model: DEFAULT_OPENAI_MODEL,
+    jobKey: jobKey || "",
+  });
+}
+
+async function shortenResumeCandidateEdits(originalResume, candidateEdits, jdAnalysis, apiKey, jobKey) {
+  const userContent =
+    "MASTER RESUME:\n" + JSON.stringify(originalResume || {}, null, 2) + "\n\n" +
+    "JOB DESCRIPTION ANALYSIS:\n" + JSON.stringify(jdAnalysis || {}, null, 2) + "\n\n" +
+    "CURRENT CANDIDATE_EDITS:\n" + JSON.stringify(candidateEdits || {}, null, 2);
+
+  return await callOpenAi({
+    systemPrompt: RESUME_EDITS_SHORTEN_PROMPT,
+    userContent,
+    apiKey,
+    expectJson: true,
+    requiredKeys: ["experience", "projects"],
+    temperature: 0.2,
+    operation: "tailorResume",
+    model: DEFAULT_OPENAI_MODEL,
+    jobKey: jobKey || "",
+  });
+}
+
 function computeResumeDiff(original, tailored) {
   const diff = [];
   for (const sectionKey of ["experience", "projects"]) {
@@ -1334,6 +1748,125 @@ function applyTailorGuardrails(originalResume, candidateEdits) {
   return frozenResume;
 }
 
+function buildResumeLineBindings(lines, resume) {
+  var available = (lines || []).map(function (line) {
+    return {
+      id: line.id,
+      text: line.text || "",
+      normalized: normalizeComparableText(line.text || ""),
+    };
+  });
+  var used = {};
+
+  function bindText(text) {
+    var normalized = normalizeComparableText(text);
+    if (!normalized) return "";
+
+    var exact = available.find(function (line) {
+      return !used[line.id] && line.normalized === normalized;
+    });
+    if (exact) {
+      used[exact.id] = true;
+      return exact.id;
+    }
+
+    var contains = available.find(function (line) {
+      return !used[line.id] && (line.normalized.indexOf(normalized) !== -1 || normalized.indexOf(line.normalized) !== -1);
+    });
+    if (contains) {
+      used[contains.id] = true;
+      return contains.id;
+    }
+
+    var bestId = "";
+    var bestScore = 0;
+    available.forEach(function (line) {
+      if (used[line.id]) return;
+      var score = comparableOverlapScore(normalized, line.normalized);
+      if (score > bestScore) {
+        bestScore = score;
+        bestId = line.id;
+      }
+    });
+    if (bestId && bestScore >= 0.45) {
+      used[bestId] = true;
+      return bestId;
+    }
+    return "";
+  }
+
+  function sectionBindings(items, sectionKey) {
+    return (items || []).map(function (item) {
+      return {
+        id: item.id,
+        section: sectionKey,
+        headlineLineId: item.headline ? bindText(item.headline) : "",
+        bulletLineIds: (item.bullets || []).map(function (bullet) {
+          return {
+            id: bullet.id,
+            lineId: bindText(bullet.text || ""),
+          };
+        }),
+      };
+    });
+  }
+
+  return {
+    experience: sectionBindings(resume && resume.experience, "experience"),
+    projects: sectionBindings(resume && resume.projects, "projects"),
+  };
+}
+
+function applyCandidateEditsToCanonicalResumeHtml(html, originalResume, candidateEdits) {
+  var meta = extractCanonicalResumeMeta(html);
+  if (!meta || !Array.isArray(meta.lines) || !meta.lines.length) return null;
+
+  var linesById = {};
+  meta.lines.forEach(function (line) {
+    linesById[line.id] = cloneJson(line);
+  });
+  var bindings = buildResumeLineBindings(meta.lines, originalResume);
+
+  function applySection(sectionKey) {
+    var editsById = {};
+    (candidateEdits && candidateEdits[sectionKey] || []).forEach(function (item) {
+      if (item && item.id) editsById[item.id] = item;
+    });
+    (bindings[sectionKey] || []).forEach(function (binding) {
+      var edit = editsById[binding.id];
+      if (!edit) return;
+      if (binding.headlineLineId && typeof edit.headline === "string" && linesById[binding.headlineLineId]) {
+        linesById[binding.headlineLineId].text = edit.headline.trim();
+      }
+      var bulletEditById = {};
+      (edit.bullets || []).forEach(function (bullet) {
+        if (bullet && bullet.id) bulletEditById[bullet.id] = bullet;
+      });
+      (binding.bulletLineIds || []).forEach(function (bulletBinding) {
+        var bulletEdit = bulletEditById[bulletBinding.id];
+        if (!bulletEdit || !bulletBinding.lineId || !linesById[bulletBinding.lineId]) return;
+        if (bulletEdit.text && String(bulletEdit.text).trim()) {
+          linesById[bulletBinding.lineId].text = String(bulletEdit.text).trim();
+        }
+      });
+    });
+  }
+
+  applySection("experience");
+  applySection("projects");
+
+  var nextMeta = cloneJson(meta);
+  nextMeta.lines = meta.lines.map(function (line) {
+    return linesById[line.id] || line;
+  });
+
+  return {
+    html: buildCanonicalResumeHtml(nextMeta),
+    meta: nextMeta,
+    bindings: bindings,
+  };
+}
+
 async function resolveActiveResumeContext(jobKey, options) {
   var opts = options || {};
   var profile = normalizeProfile(opts.profile || await getProfile());
@@ -1361,16 +1894,18 @@ async function resolveActiveResumeContext(jobKey, options) {
     }
   }
 
-  var uploadFile = sourceDoc ? {
-    dataBase64: sourceDoc.dataBase64,
-    name: sourceDoc.name || "resume.pdf",
-    mime: sourceDoc.mime || "application/pdf",
+  var uploadPayload = sourceDoc ? extractResumeDownloadPayload(sourceDoc) : null;
+  var uploadFile = uploadPayload ? {
+    dataBase64: uploadPayload.dataBase64,
+    name: uploadPayload.name || "resume.pdf",
+    mime: uploadPayload.mime || "application/pdf",
     id: sourceDoc.id || "",
     createdAt: sourceDoc.createdAt || null,
   } : null;
 
   var structuredResume = storedResume ? ensureResumeIds(mergeProfileIntoResume(storedResume, profile)) : null;
   var fallbackResume = structuredResume;
+  var htmlSource = sourceDoc ? canonicalHtmlSourceForDoc(sourceDoc) : null;
   var parseMeta = {
     attempted: false,
     ok: false,
@@ -1379,12 +1914,15 @@ async function resolveActiveResumeContext(jobKey, options) {
     fingerprint: "",
     sourceType: sourceType,
     sourceName: sourceName,
+    sourceFormat: htmlSource ? "html" : (sourceDoc ? "pdf" : (storedResume ? "json" : "profile")),
+    hasCanonicalHtml: !!htmlSource,
+    canonicalPageCount: sourceDoc && sourceDoc.canonicalHtmlPageCount ? sourceDoc.canonicalHtmlPageCount : 0,
   };
 
-  if (sourceDoc && sourceDoc.dataBase64 && opts.allowParse !== false && opts.apiKey) {
+  if (htmlSource && htmlSource.dataBase64 && opts.allowParse !== false && opts.apiKey) {
     parseMeta.attempted = true;
     try {
-      var fingerprint = await sha256HexForBase64(sourceDoc.dataBase64);
+      var fingerprint = await sha256HexForBase64(htmlSource.dataBase64);
       parseMeta.fingerprint = fingerprint;
       var cached = await getCachedParsedResume(fingerprint);
       if (cached && cached.resume) {
@@ -1393,7 +1931,7 @@ async function resolveActiveResumeContext(jobKey, options) {
         parseMeta.cached = true;
         parseMeta.fallbackUsed = false;
       } else {
-        var resumeText = await extractPdfTextFromBase64(sourceDoc.dataBase64);
+        var resumeText = resumeTextFromCanonicalHtml(base64ToUtf8(htmlSource.dataBase64));
         if (resumeText && resumeText.length >= 80) {
           var parsedResume = await parseResumeTextWithOpenAi(resumeText, profile, opts.apiKey, jobKey);
           structuredResume = parsedResume;
@@ -1410,6 +1948,36 @@ async function resolveActiveResumeContext(jobKey, options) {
       }
     } catch (err) {
       parseMeta.error = err && err.message ? err.message : String(err);
+    }
+  } else if (sourceDoc && sourceDoc.dataBase64 && opts.allowParse !== false && opts.apiKey) {
+    parseMeta.attempted = true;
+    try {
+      var pdfFingerprint = await sha256HexForBase64(sourceDoc.dataBase64);
+      parseMeta.fingerprint = pdfFingerprint;
+      var cachedPdf = await getCachedParsedResume(pdfFingerprint);
+      if (cachedPdf && cachedPdf.resume) {
+        structuredResume = ensureResumeIds(mergeProfileIntoResume(cachedPdf.resume, profile));
+        parseMeta.ok = true;
+        parseMeta.cached = true;
+        parseMeta.fallbackUsed = false;
+      } else {
+        var pdfText = await extractPdfTextFromBase64(sourceDoc.dataBase64);
+        if (pdfText && pdfText.length >= 80) {
+          var parsedFromPdf = await parseResumeTextWithOpenAi(pdfText, profile, opts.apiKey, jobKey);
+          structuredResume = parsedFromPdf;
+          parseMeta.ok = true;
+          parseMeta.fallbackUsed = false;
+          await saveParsedResumeCache({
+            fingerprint: pdfFingerprint,
+            sourceType: sourceType,
+            sourceName: sourceName,
+            updatedAt: new Date().toISOString(),
+            resume: parsedFromPdf,
+          });
+        }
+      }
+    } catch (pdfErr) {
+      parseMeta.error = pdfErr && pdfErr.message ? pdfErr.message : String(pdfErr);
     }
   }
 
@@ -1428,6 +1996,8 @@ async function resolveActiveResumeContext(jobKey, options) {
     sourceName: sourceName,
     hasUploadFile: !!uploadFile,
     uploadFile: uploadFile,
+    htmlSource: htmlSource,
+    sourceDoc: sourceDoc,
     structuredResume: structuredResume,
     personal: (structuredResume && structuredResume.personal) ? structuredResume.personal : {},
     parseMeta: parseMeta,
@@ -1577,6 +2147,38 @@ async function waitForPdfReady(target) {
   throw new Error("PDF render content did not become ready");
 }
 
+async function estimateRenderedPageMetrics(target) {
+  var result = await debuggerSend(target, "Runtime.evaluate", {
+    expression:
+      "(function () {" +
+      "var body = document.body || document.documentElement;" +
+      "var page = document.querySelector('.resume-page, .page, [data-jaf-page-height]');" +
+      "var pageHeight = 0;" +
+      "if (page) {" +
+      "  var attrHeight = parseFloat(page.getAttribute('data-jaf-page-height') || '0');" +
+      "  pageHeight = attrHeight || page.clientHeight || page.getBoundingClientRect().height || 0;" +
+      "}" +
+      "var maxBottom = 0;" +
+      "var pageTop = page ? page.getBoundingClientRect().top : 0;" +
+      "var tracked = document.querySelectorAll('.jaf-editable-line, .jaf-resume-line, .body, .closing');" +
+      "for (var i = 0; i < tracked.length; i++) {" +
+      "  var rect = tracked[i].getBoundingClientRect();" +
+      "  if (rect.bottom > maxBottom) maxBottom = rect.bottom;" +
+      "}" +
+      "var scrollHeight = page ? Math.max(page.scrollHeight, page.clientHeight) : Math.max(body.scrollHeight || 0, document.documentElement.scrollHeight || 0);" +
+      "var effectiveHeight = maxBottom && page ? Math.max(maxBottom - pageTop, scrollHeight) : scrollHeight;" +
+      "var fallbackPageHeight = pageHeight || 1056;" +
+      "return {" +
+      "  pageHeight: fallbackPageHeight," +
+      "  contentHeight: effectiveHeight," +
+      "  pageCount: Math.max(1, Math.ceil(effectiveHeight / fallbackPageHeight))" +
+      "};" +
+      "})()",
+    returnByValue: true,
+  });
+  return result && result.result ? (result.result.value || { pageCount: 1, pageHeight: 1056, contentHeight: 0 }) : { pageCount: 1, pageHeight: 1056, contentHeight: 0 };
+}
+
 async function renderHtmlToPdf(msg) {
   if (!msg.html) return { ok: false, error: "Missing HTML payload" };
 
@@ -1605,6 +2207,7 @@ async function renderHtmlToPdf(msg) {
         html: String(msg.html),
       });
       await waitForPdfReady(target);
+      var pageMetrics = await estimateRenderedPageMetrics(target);
       var pdfResult = await debuggerSend(target, "Page.printToPDF", {
         printBackground: true,
         preferCSSPageSize: true,
@@ -1619,6 +2222,8 @@ async function renderHtmlToPdf(msg) {
           size: base64ByteLength(pdfResult.data),
           createdAt: new Date().toISOString(),
           dataBase64: pdfResult.data,
+          pageCount: pageMetrics.pageCount || 1,
+          pageMetrics: pageMetrics,
         },
       };
     } finally {
@@ -1631,6 +2236,51 @@ async function renderHtmlToPdf(msg) {
       try { await chrome.tabs.remove(tab.id); } catch (closeErr) {}
     }
   }
+}
+
+async function buildOptimizedResumeDocFromCanonicalHtml(activeResume, originalResume, candidateEdits, jdAnalysis, apiKey, jobKey, filenameBase) {
+  if (!activeResume || !activeResume.htmlSource || !activeResume.htmlSource.dataBase64) return null;
+
+  var sourceHtml = base64ToUtf8(activeResume.htmlSource.dataBase64);
+  var workingEdits = cloneJson(candidateEdits) || { experience: [], projects: [] };
+  var lastError = null;
+
+  for (var attempt = 0; attempt < 3; attempt++) {
+    var applied = applyCandidateEditsToCanonicalResumeHtml(sourceHtml, originalResume, workingEdits);
+    if (!applied || !applied.html) {
+      throw new Error("Could not map resume edits onto the uploaded resume layout.");
+    }
+
+    var renderResult = await renderHtmlToPdf({
+      html: applied.html,
+      filename: ensurePdfFilename(filenameBase || "tailored-resume.pdf"),
+    });
+    if (!renderResult.ok || !renderResult.doc) {
+      throw new Error(renderResult.error || "Resume PDF render failed");
+    }
+    if ((renderResult.doc.pageCount || 1) <= 1) {
+      return {
+        doc: {
+          id: genId("doc"),
+          name: canonicalResumePdfName(filenameBase || "tailored-resume"),
+          mime: "text/html",
+          size: base64ByteLength(utf8StringToBase64(applied.html)),
+          createdAt: new Date().toISOString(),
+          dataBase64: utf8StringToBase64(applied.html),
+          sourceFormat: "canonicalHtmlResume",
+          canonicalHtmlName: canonicalResumeHtmlName(filenameBase || "tailored-resume"),
+          canonicalHtmlPageCount: 1,
+          derivedPdf: renderResult.doc,
+        },
+        candidateEdits: workingEdits,
+      };
+    }
+
+    lastError = new Error("Resume exceeded one page after optimization.");
+    workingEdits = await shortenResumeCandidateEdits(originalResume, workingEdits, jdAnalysis, apiKey, jobKey);
+  }
+
+  throw lastError || new Error("Resume could not be shortened to one page.");
 }
 
 // ---- Message handler -------------------------------------------------------
@@ -1671,6 +2321,8 @@ async function handleMessage(msg, sender) {
               mime: basePdf.mime,
               size: basePdf.size,
               createdAt: basePdf.createdAt,
+              hasCanonicalHtml: !!basePdf.canonicalHtmlBase64,
+              canonicalPageCount: basePdf.canonicalHtmlPageCount || 0,
             }
           : null,
         resumeAvailableForAi: !!(storedResume || basePdf),
@@ -1703,8 +2355,7 @@ async function handleMessage(msg, sender) {
 
     case "saveBaseResumePdf":
       if (!msg.pdf || !msg.pdf.dataBase64) return { ok: false, error: "Missing PDF data" };
-      await saveBaseResumePdf(msg.pdf);
-      return { ok: true };
+      return { ok: true, pdf: await saveBaseResumePdf(msg.pdf) };
 
     case "getBaseResumePdf":
       return { ok: true, pdf: await getBaseResumePdf() };
@@ -1732,6 +2383,7 @@ async function handleMessage(msg, sender) {
           sourceType: activeResume.sourceType,
           sourceName: activeResume.sourceName,
           hasUploadFile: activeResume.hasUploadFile,
+          hasCanonicalHtml: !!(activeResume.htmlSource && activeResume.htmlSource.dataBase64),
           personal: activeResume.personal,
           parseMeta: activeResume.parseMeta,
         },
@@ -1747,9 +2399,18 @@ async function handleMessage(msg, sender) {
         return { ok: false, error: "Invalid docType" };
       }
       if (!msg.doc || !msg.doc.dataBase64) return { ok: false, error: "Missing document data" };
+      var safeDoc = cloneJson(msg.doc) || {};
+      if (msg.docType === "editedResume" && String(safeDoc.mime || "").toLowerCase() === "application/pdf") {
+        safeDoc = mergeObjects(safeDoc, await convertResumePdfToCanonicalAssets(safeDoc));
+        safeDoc.mime = "text/html";
+        safeDoc.name = safeDoc.sourcePdfName || canonicalResumePdfName(msg.doc.name || "resume");
+        safeDoc.dataBase64 = safeDoc.canonicalHtmlBase64;
+        safeDoc.size = base64ByteLength(safeDoc.dataBase64);
+        safeDoc.sourceFormat = "canonicalHtmlResume";
+      }
       await ensureArchiveReady();
-      await ArchiveDB.saveJobDocument(msg.jobKey, msg.jobMeta, msg.docType, msg.doc);
-      return { ok: true };
+      await ArchiveDB.saveJobDocument(msg.jobKey, msg.jobMeta, msg.docType, safeDoc);
+      return { ok: true, doc: safeDoc };
 
     case "deleteJobDocument":
       if (!msg.jobKey) return { ok: false, error: "Missing jobKey" };
@@ -1803,6 +2464,9 @@ async function handleMessage(msg, sender) {
 
     case "generateCoverLetter":
       return await handleGenerateCoverLetter(msg);
+
+    case "shortenCoverLetter":
+      return await handleShortenCoverLetter(msg);
 
     case "opportunityDetected":
       return handleOpportunityDetected(msg, sender);
@@ -1886,6 +2550,7 @@ async function handleAutofill(msg, sender) {
 
   // 3. Rule-based matching (shared module loaded via importScripts)
   let mappings = MatchRules.ruleBasedMatch(fields, profile);
+  mappings = attachFieldMetadataToMappings(fields, mappings);
 
   // 4. Optional LLM fallback for unmatched fields
   if (llmEnabled && apiKey) {
@@ -1984,6 +2649,7 @@ async function handleAutofill(msg, sender) {
       activeResume: {
         sourceType: activeResume.sourceType,
         sourceName: activeResume.sourceName,
+        hasCanonicalHtml: !!(activeResume.htmlSource && activeResume.htmlSource.dataBase64),
         parseMeta: activeResume.parseMeta,
       },
     };
@@ -2002,6 +2668,7 @@ async function handleAutofill(msg, sender) {
     activeResume: {
       sourceType: activeResume.sourceType,
       sourceName: activeResume.sourceName,
+      hasCanonicalHtml: !!(activeResume.htmlSource && activeResume.htmlSource.dataBase64),
       parseMeta: activeResume.parseMeta,
     },
   };
@@ -2195,6 +2862,7 @@ async function handleAnalyzeResumeGaps(msg) {
     activeResume: {
       sourceType: activeResume.sourceType,
       sourceName: activeResume.sourceName,
+      hasCanonicalHtml: !!(activeResume.htmlSource && activeResume.htmlSource.dataBase64),
       parseMeta: activeResume.parseMeta,
     },
   };
@@ -2229,7 +2897,27 @@ async function handleExecuteResumeOptimization(msg) {
     return { ok: false, error: "Optimization failed: " + (err.message || String(err)) };
   }
 
-  const tailoredResume = applyTailorGuardrails(resume, tailorResult.candidate_edits || {});
+  let candidateEdits = cloneJson(tailorResult.candidate_edits || { experience: [], projects: [] });
+  let resumeDoc = null;
+  try {
+    const optimizedDocResult = await buildOptimizedResumeDocFromCanonicalHtml(
+      activeResume,
+      resume,
+      candidateEdits,
+      jdAnalysis,
+      apiKey,
+      msg.jobKey,
+      "tailored-resume.pdf"
+    );
+    if (optimizedDocResult && optimizedDocResult.doc) {
+      resumeDoc = optimizedDocResult.doc;
+      candidateEdits = optimizedDocResult.candidateEdits || candidateEdits;
+    }
+  } catch (resumeDocErr) {
+    console.warn("[JobAutofill BG] Canonical resume render failed:", resumeDocErr);
+  }
+
+  const tailoredResume = applyTailorGuardrails(resume, candidateEdits);
   const requirementsGaps = tailorResult.requirements_gaps || [];
   const diff = computeResumeDiff(resume, tailoredResume);
 
@@ -2240,9 +2928,11 @@ async function handleExecuteResumeOptimization(msg) {
     jdAnalysis: jdAnalysis,
     requirementsGaps: requirementsGaps,
     diff: diff,
+    resumeDoc: resumeDoc,
     activeResume: {
       sourceType: activeResume.sourceType,
       sourceName: activeResume.sourceName,
+      hasCanonicalHtml: !!(activeResume.htmlSource && activeResume.htmlSource.dataBase64),
       parseMeta: activeResume.parseMeta,
       personal: activeResume.personal,
     },
@@ -2293,10 +2983,36 @@ async function handleGenerateCoverLetter(msg) {
     activeResume: {
       sourceType: activeResume.sourceType,
       sourceName: activeResume.sourceName,
+      hasCanonicalHtml: !!(activeResume.htmlSource && activeResume.htmlSource.dataBase64),
       parseMeta: activeResume.parseMeta,
       personal: activeResume.personal,
     },
   };
+}
+
+async function handleShortenCoverLetter(msg) {
+  const apiKey = await getApiKey();
+  if (!apiKey) return { ok: false, error: "No OpenAI API key configured. Set it in Options." };
+  const llmOn = await isLlmEnabled();
+  if (!llmOn) return { ok: false, error: "LLM is disabled. Enable it in Options." };
+  const styleProfile = await getStyleProfile();
+  if (!msg.coverLetterText || !String(msg.coverLetterText).trim()) {
+    return { ok: false, error: "Missing cover letter text." };
+  }
+  try {
+    return {
+      ok: true,
+      coverLetterText: await shortenCoverLetterText(
+        msg.coverLetterText,
+        msg.jdAnalysis || null,
+        styleProfile,
+        apiKey,
+        msg.jobKey || ""
+      ),
+    };
+  } catch (err) {
+    return { ok: false, error: "Cover letter shortening failed: " + (err.message || String(err)) };
+  }
 }
 
 // Log extension startup

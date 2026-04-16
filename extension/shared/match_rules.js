@@ -369,8 +369,9 @@ var MatchRules = (function () {
 
   function valueForRule(rule, profile, field, signal) {
     var value = rule.derive ? rule.derive(profile, field, signal) : resolveKey(profile, rule.key);
+    var isDropdown = field.tag === "select" || field.control_kind === "native_select" || field.control_kind === "custom_select";
 
-    if (field.tag === "select" && field.options && field.options.length > 0) {
+    if (isDropdown && field.options && field.options.length > 0) {
       if (rule.key === "require_sponsorship") {
         value = matchBooleanOption(value, field.options);
       } else if (rule.key === "work_authorization") {
@@ -380,6 +381,8 @@ var MatchRules = (function () {
       } else {
         value = matchGenericOption(value, field.options);
       }
+    } else if (field.control_kind === "custom_select") {
+      value = value === null || value === undefined ? "" : String(value);
     }
 
     if ((field.type === "checkbox" || field.type === "radio") && rule.key === "require_sponsorship") {

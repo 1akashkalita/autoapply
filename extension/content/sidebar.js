@@ -770,8 +770,10 @@ window.JobAutofill = window.JobAutofill || {};
       if (!currentJobKey) { setDocsStatus("No job detected for this tab yet.", false); return; }
       var personal = await getCurrentPersonalInfo();
       var doc;
+      var fitted;
       try {
-        doc = await JA.renderCoverLetterPdfDoc(text, currentJobMeta, personal, buildAiFilename("cover-letter", "pdf"));
+        fitted = await renderCoverLetterDocWithOnePageLimit(text, personal, cachedJdAnalysis);
+        doc = fitted.doc;
       } catch (err) {
         setDocsStatus("PDF export failed: " + String(err), false);
         return;
@@ -781,7 +783,7 @@ window.JobAutofill = window.JobAutofill || {};
         jobMeta: currentJobMeta, docType: "coverLetter", doc: doc,
       });
       if (resp.ok) {
-        $.coverLetterText.value = "";
+        $.coverLetterText.value = fitted && fitted.text ? fitted.text : "";
         setDocsStatus("Cover letter saved.", true);
         await refreshDocsList();
       } else {
@@ -932,12 +934,10 @@ window.JobAutofill = window.JobAutofill || {};
       if (result.coverLetterText) {
         var personal = (result.activeResume && result.activeResume.personal) ? result.activeResume.personal : await getCurrentPersonalInfo();
         try {
-          var pdfDoc = await JA.renderCoverLetterPdfDoc(
-            result.coverLetterText,
-            currentJobMeta,
-            personal,
-            buildAiFilename("cover-letter", "pdf")
-          );
+          var fittedResult = await renderCoverLetterDocWithOnePageLimit(result.coverLetterText, personal, result.jdAnalysis);
+          result.coverLetterText = fittedResult.text;
+          $.standaloneCoverLetter.value = fittedResult.text;
+          var pdfDoc = fittedResult.doc;
           pdfDoc.createdAt = new Date().toISOString();
           JA.downloadBase64File(pdfDoc.dataBase64, pdfDoc.name, pdfDoc.mime);
           if (currentJobKey) {
@@ -959,7 +959,9 @@ window.JobAutofill = window.JobAutofill || {};
       if (!text) return;
       var personal = await getCurrentPersonalInfo();
       try {
-        var doc = await JA.renderCoverLetterPdfDoc(text, currentJobMeta, personal, buildAiFilename("cover-letter", "pdf"));
+        var fitted = await renderCoverLetterDocWithOnePageLimit(text, personal, cachedJdAnalysis);
+        $.standaloneCoverLetter.value = fitted.text;
+        var doc = fitted.doc;
         JA.downloadBase64File(doc.dataBase64, doc.name, doc.mime);
       } catch (pdfErr) {
         showCoverLetterError("PDF export failed: " + String(pdfErr));
@@ -987,6 +989,47 @@ window.JobAutofill = window.JobAutofill || {};
     $.resultStats.innerHTML = "";
     $.resultList.innerHTML = '<div class="result-item"><span class="result-value skipped">' +
       escHtml(message || "Unknown error") + '</span></div>';
+  }
+
+  function preferredDownloadDoc(doc) {
+    if (!doc) return null;
+    if (doc.derivedPdf && doc.derivedPdf.dataBase64) return doc.derivedPdf;
+    if (doc.sourcePdfDataBase64) {
+      return {
+        dataBase64: doc.sourcePdfDataBase64,
+        name: doc.sourcePdfName || "resume.pdf",
+        mime: doc.sourcePdfMime || "application/pdf",
+      };
+    }
+    return doc;
+  }
+
+  async function renderCoverLetterDocWithOnePageLimit(text, personal, jdAnalysis) {
+    var currentText = String(text || "").trim();
+    var lastError = null;
+
+    for (var attempt = 0; attempt < 3; attempt++) {
+      var doc = await JA.renderCoverLetterPdfDoc(
+        currentText,
+        currentJobMeta,
+        personal,
+        buildAiFilename("cover-letter", "pdf")
+      );
+      if ((doc.pageCount || 1) <= 1) {
+        return { doc: doc, text: currentText };
+      }
+      lastError = new Error("Cover letter exceeded one page.");
+      var shortenResp = await sendBg({
+        action: "shortenCoverLetter",
+        coverLetterText: currentText,
+        jdAnalysis: jdAnalysis || cachedJdAnalysis || null,
+        jobKey: currentJobKey || "",
+      });
+      if (!shortenResp.ok || !shortenResp.coverLetterText) break;
+      currentText = shortenResp.coverLetterText;
+    }
+
+    throw lastError || new Error("Cover letter could not be shortened to one page.");
   }
 
   function showAiPreviewError(message) {
@@ -1144,7 +1187,8 @@ window.JobAutofill = window.JobAutofill || {};
     var arr = docType === "editedResume" ? (resp.bucket.editedResumes || []) : (resp.bucket.coverLetters || []);
     var doc = arr.find(function (d) { return d && d.id === id; });
     if (!doc || !doc.dataBase64) { setDocsStatus("Document not found.", false); return; }
-    downloadBase64(doc.dataBase64, buildJobFilename(currentJobMeta, docType, doc), doc.mime || "application/octet-stream");
+    var payload = preferredDownloadDoc(doc);
+    downloadBase64(payload.dataBase64, buildJobFilename(currentJobMeta, docType, payload || doc), payload.mime || "application/octet-stream");
     setDocsStatus("Download started.", true);
   }
 
@@ -1204,9 +1248,12 @@ window.JobAutofill = window.JobAutofill || {};
     }
     willFill.forEach(function (m) {
       var isLlm = m.source === "llm";
+      var displayValue = (m.control_kind === "native_select" || m.control_kind === "custom_select")
+        ? ("Select: " + m.value)
+        : m.value;
       html += '<div class="result-item"><span class="result-field" title="' + escHtml(m.field_label) + '">' +
         escHtml(truncate(m.field_label, 28)) + (isLlm ? '<span class="badge-llm">via AI</span>' : '') +
-        '</span><span class="result-value" title="' + escHtml(m.value) + '">' + escHtml(truncate(m.value, 32)) + '</span></div>';
+        '</span><span class="result-value" title="' + escHtml(displayValue) + '">' + escHtml(truncate(displayValue, 32)) + '</span></div>';
     });
     willSkip.forEach(function (s) {
       html += '<div class="result-item"><span class="result-field" title="' + escHtml(s.field_label) + '">' + escHtml(truncate(s.field_label, 30)) +
@@ -1232,9 +1279,12 @@ window.JobAutofill = window.JobAutofill || {};
     var html = "";
     filled.forEach(function (f) {
       var isLlm = f.selector && llmSelectors[f.selector];
+      var displayValue = (f.control_kind === "native_select" || f.control_kind === "custom_select")
+        ? ("Select: " + f.value)
+        : f.value;
       html += '<div class="result-item"><span class="result-field" title="' + escHtml(f.field) + '">' +
         escHtml(truncate(f.field, 28)) + (isLlm ? '<span class="badge-llm">via AI</span>' : '') +
-        '</span><span class="result-value" title="' + escHtml(f.value) + '">' + escHtml(truncate(f.value, 32)) + '</span></div>';
+        '</span><span class="result-value" title="' + escHtml(displayValue) + '">' + escHtml(truncate(displayValue, 32)) + '</span></div>';
     });
     skipped.forEach(function (sk) {
       html += '<div class="result-item"><span class="result-field" title="' + escHtml(sk.field) + '">' + escHtml(truncate(sk.field, 30)) +
@@ -1372,11 +1422,15 @@ window.JobAutofill = window.JobAutofill || {};
     var personal = (result.activeResume && result.activeResume.personal) ? result.activeResume.personal : await getCurrentPersonalInfo();
     var now = new Date().toISOString();
 
-    if (result.tailoredResume && JA.buildResumeHtml && JA.renderPdfFromHtml) {
-      var resumeHtml = JA.buildResumeHtml(result.tailoredResume);
-      var resumeDoc  = await JA.renderPdfFromHtml(resumeHtml, buildAiFilename("tailored-resume", "pdf"));
+    if (result.resumeDoc || (result.tailoredResume && JA.buildResumeHtml && JA.renderPdfFromHtml)) {
+      var resumeDoc = result.resumeDoc || null;
+      if (!resumeDoc) {
+        var resumeHtml = JA.buildResumeHtml(result.tailoredResume);
+        resumeDoc  = await JA.renderPdfFromHtml(resumeHtml, buildAiFilename("tailored-resume", "pdf"));
+      }
       resumeDoc.createdAt = now;
-      JA.downloadBase64File(resumeDoc.dataBase64, resumeDoc.name, resumeDoc.mime);
+      var resumeDownloadDoc = preferredDownloadDoc(resumeDoc);
+      JA.downloadBase64File(resumeDownloadDoc.dataBase64, resumeDownloadDoc.name, resumeDownloadDoc.mime);
       if (currentJobKey) {
         await sendBg({
           action: "saveJobDocument", jobKey: currentJobKey, jobMeta: currentJobMeta,
@@ -1387,12 +1441,9 @@ window.JobAutofill = window.JobAutofill || {};
     }
 
     if (result.coverLetterText && JA.renderCoverLetterPdfDoc) {
-      var clDoc = await JA.renderCoverLetterPdfDoc(
-        result.coverLetterText,
-        currentJobMeta,
-        personal,
-        buildAiFilename("cover-letter", "pdf")
-      );
+      var coverResult = await renderCoverLetterDocWithOnePageLimit(result.coverLetterText, personal, result.jdAnalysis);
+      var clDoc = coverResult.doc;
+      result.coverLetterText = coverResult.text;
       clDoc.createdAt = now;
       JA.downloadBase64File(clDoc.dataBase64, clDoc.name, clDoc.mime);
       if (currentJobKey) {
